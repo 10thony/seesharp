@@ -1,0 +1,327 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <title>Pokemon Battle Scene - Pixel Art</title>
+    <style>
+        body {
+            background: #111;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        canvas {
+            image-rendering: pixelated;
+            border: 3px solid #333;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="c"></canvas>
+    <script>
+        const canvas = document.getElementById("c");
+        const ctx = canvas.getContext("2d");
+        const W = 256;
+        const H = 192;
+        const SCALE = 3;
+        canvas.width = W * SCALE;
+        canvas.height = H * SCALE;
+        ctx.imageSmoothingEnabled = false;
+
+        // Off-screen buffer
+        const buf = document.createElement("canvas");
+        buf.width = W;
+        buf.height = H;
+        const b = buf.getContext("2d");
+
+        function px(x, y, color) {
+            b.fillStyle = color;
+            b.fillRect(x, y, 1, 1);
+        }
+
+        function rect(x, y, w, h, color) {
+            b.fillStyle = color;
+            b.fillRect(x, y, w, h);
+        }
+
+        // --- COLOR PALETTE ---
+        const SKY = "#78b8d8";
+        const TEAL_LIGHT = "#88d8d0";
+        const TEAL = "#58b8b0";
+        const TEAL_DARK = "#389890";
+        const FLOOR_YELLOW = "#d8c850";
+        const FLOOR_GOLD = "#b8a830";
+        const FLOOR_LINE = "#e8e098";
+        const WALL_GRAY = "#a0a8b0";
+        const WALL_DARK = "#687078";
+        const WALL_LIGHT = "#c0c8d0";
+        const PURPLE = "#8060a0";
+        const PURPLE_DARK = "#604080";
+        const GREEN_LIGHT = "#68d868";
+        const GREEN_DARK = "#389838";
+        const BLACK = "#181818";
+        const WHITE = "#f8f8f8";
+        const SKIN = "#f8c890";
+        const SKIN_DARK = "#d8a060";
+        const RED_HAT = "#d83030";
+        const RED_DARK = "#a02020";
+        const BLUE_SHIRT = "#2850a8";
+        const BLUE_DARK = "#183878";
+        const YELLOW_BELT = "#f8d830";
+        const BROWN_HAIR = "#c87830";
+        const BROWN_DARK = "#985820";
+        const GRAY_SHIRT = "#607080";
+        const GRAY_LIGHT = "#90a0b0";
+        const GRAY_DARK = "#405060";
+        const PURPLE_WRIST = "#8848a0";
+        const POKEBALL_RED = "#e83830";
+        const POKEBALL_WHITE = "#f0f0f0";
+        const POKEBALL_BLACK = "#282828";
+        const DIVIDER = "#d0c840";
+        const DIVIDER_DARK = "#a89820";
+
+        // ============ BACKGROUND ============
+
+        // Top wall / ceiling
+        rect(0, 0, W, 45, WALL_GRAY);
+        // Darker top strip
+        rect(0, 0, W, 8, WALL_DARK);
+        // Purple arch at top center
+        rect(90, 0, 76, 12, PURPLE);
+        rect(95, 0, 66, 8, PURPLE_DARK);
+        // Green indicators on pillars
+        rect(60, 10, 10, 14, WALL_LIGHT);
+        rect(62, 12, 6, 10, GREEN_LIGHT);
+        rect(63, 13, 4, 8, GREEN_DARK);
+        rect(186, 10, 10, 14, WALL_LIGHT);
+        rect(188, 12, 6, 10, GREEN_LIGHT);
+        rect(189, 13, 4, 8, GREEN_DARK);
+        // Side columns
+        rect(0, 8, 12, 37, WALL_LIGHT);
+        rect(244, 8, 12, 37, WALL_LIGHT);
+        rect(2, 10, 8, 33, WALL_GRAY);
+        rect(246, 10, 8, 33, WALL_GRAY);
+
+        // --- UPPER BATTLE AREA (opponent side) ---
+        // Yellow floor for opponent
+        rect(0, 45, W, 48, FLOOR_YELLOW);
+        // Floor lines / dashes
+        for (let i = 0; i < W; i += 12) {
+            rect(i, 52, 7, 2, FLOOR_LINE);
+            rect(i + 3, 60, 7, 2, FLOOR_LINE);
+            rect(i, 68, 7, 2, FLOOR_LINE);
+            rect(i + 3, 76, 7, 2, FLOOR_LINE);
+            rect(i, 84, 7, 2, FLOOR_LINE);
+        }
+        // Darker bottom edge of upper floor
+        rect(0, 88, W, 5, FLOOR_GOLD);
+
+        // --- DIVIDER BAR ---
+        rect(0, 93, W, 6, TEAL);
+        // Divider notch (pokeball platform area)
+        rect(100, 93, 56, 6, DIVIDER);
+        rect(104, 94, 48, 4, DIVIDER_DARK);
+
+        // --- LOWER BATTLE AREA (player side) ---
+        rect(0, 99, W, 55, TEAL_LIGHT);
+        // Gradient bands
+        rect(0, 99, W, 14, TEAL_LIGHT);
+        rect(0, 113, W, 14, TEAL);
+        rect(0, 127, W, 14, TEAL);
+        rect(0, 141, W, 13, TEAL_DARK);
+
+        // --- BOTTOM BLACK BAR (text box area) ---
+        rect(0, 154, W, 38, BLACK);
+        // Inner text box border
+        rect(2, 156, W - 4, 34, "#202830");
+        rect(4, 158, W - 8, 30, "#101820");
+
+        // ============ BLUE / GARY (OPPONENT - upper right) ============
+        function drawBlue() {
+            const ox = 155;
+            const oy = 24;
+
+            // -- Hair (spiky brown/orange) --
+            // Main hair mass
+            const hair = BROWN_HAIR;
+            const hairD = BROWN_DARK;
+            // Spiky top
+            rect(ox + 12, oy - 8, 3, 3, hair);
+            rect(ox + 16, oy - 14, 3, 4, hair);
+            rect(ox + 19, oy - 18, 3, 5, hair);
+            rect(ox + 22, oy - 16, 3, 6, hair);
+            rect(ox + 25, oy - 12, 3, 5, hair);
+            rect(ox + 15, oy - 10, 16, 4, hair);
+            rect(ox + 13, oy - 6, 18, 6, hair);
+            // More spikes going right
+            rect(ox + 28, oy - 14, 3, 4, hair);
+            rect(ox + 31, oy - 18, 3, 5, hairD);
+            rect(ox + 34, oy - 15, 3, 6, hair);
+            rect(ox + 37, oy - 12, 2, 5, hairD);
+            rect(ox + 30, oy - 10, 10, 5, hair);
+            rect(ox + 31, oy - 5, 8, 4, hairD);
+            // Top spike
+            rect(ox + 22, oy - 22, 3, 5, hair);
+            rect(ox + 24, oy - 25, 2, 4, hairD);
+
+            // -- Face --
+            rect(ox + 16, oy, 14, 10, SKIN);
+            rect(ox + 15, oy + 2, 16, 7, SKIN);
+            // Eyes
+            px(ox + 19, oy + 3, BLACK);
+            px(ox + 19, oy + 4, BLACK);
+            px(ox + 26, oy + 3, BLACK);
+            px(ox + 26, oy + 4, BLACK);
+            // Mouth
+            px(ox + 22, oy + 7, SKIN_DARK);
+            px(ox + 23, oy + 7, SKIN_DARK);
+
+            // -- Neck --
+            rect(ox + 19, oy + 10, 8, 3, SKIN);
+
+            // -- Gray shirt / jacket --
+            rect(ox + 10, oy + 13, 26, 18, GRAY_SHIRT);
+            rect(ox + 12, oy + 14, 22, 16, GRAY_LIGHT);
+            rect(ox + 14, oy + 15, 18, 14, GRAY_SHIRT);
+            // Collar
+            rect(ox + 17, oy + 12, 12, 3, GRAY_LIGHT);
+            // Dark undershirt
+            rect(ox + 19, oy + 14, 8, 10, GRAY_DARK);
+
+            // -- Left arm (pointing forward toward viewer) --
+            // Upper arm
+            rect(ox + 4, oy + 14, 8, 6, GRAY_SHIRT);
+            rect(ox + 0, oy + 16, 6, 5, GRAY_SHIRT);
+            // Forearm
+            rect(ox - 3, oy + 18, 6, 5, SKIN);
+            // Purple wristband
+            rect(ox - 5, oy + 20, 4, 4, PURPLE_WRIST);
+            // Hand
+            rect(ox - 7, oy + 21, 4, 4, SKIN);
+            rect(ox - 8, oy + 22, 2, 3, SKIN);
+
+            // Pokeball in hand hint
+            px(ox - 9, oy + 23, POKEBALL_RED);
+            px(ox - 9, oy + 24, POKEBALL_WHITE);
+
+            // -- Right arm --
+            rect(ox + 34, oy + 14, 6, 8, GRAY_SHIRT);
+            rect(ox + 36, oy + 20, 5, 5, SKIN);
+        }
+
+        // ============ RED (PLAYER - lower left) ============
+        function drawRed() {
+            const ox = 30;
+            const oy = 95;
+
+            // -- Red & white hat --
+            rect(ox + 6, oy - 16, 18, 4, RED_HAT);
+            rect(ox + 4, oy - 14, 22, 3, RED_HAT);
+            rect(ox + 8, oy - 12, 16, 4, RED_HAT);
+            // White front of hat
+            rect(ox + 7, oy - 16, 6, 2, WHITE);
+            rect(ox + 5, oy - 14, 4, 2, WHITE);
+            // Hat brim
+            rect(ox + 3, oy - 9, 20, 3, RED_HAT);
+            rect(ox + 1, oy - 8, 24, 2, RED_DARK);
+
+            // -- Hair (black, peeking under hat) --
+            rect(ox + 4, oy - 7, 4, 5, BLACK);
+            rect(ox + 22, oy - 8, 4, 6, BLACK);
+            rect(ox + 8, oy - 7, 14, 2, BLACK);
+
+            // -- Face --
+            rect(ox + 7, oy - 5, 16, 10, SKIN);
+            rect(ox + 6, oy - 3, 18, 7, SKIN);
+            // Eyes
+            px(ox + 10, oy - 3, BLACK);
+            px(ox + 10, oy - 2, BLACK);
+            px(ox + 11, oy - 3, WHITE);
+            px(ox + 18, oy - 3, BLACK);
+            px(ox + 18, oy - 2, BLACK);
+            px(ox + 19, oy - 3, WHITE);
+            // Mouth / determined expression
+            px(ox + 13, oy + 2, SKIN_DARK);
+            px(ox + 14, oy + 2, SKIN_DARK);
+            px(ox + 15, oy + 2, SKIN_DARK);
+
+            // -- Neck --
+            rect(ox + 11, oy + 5, 8, 3, SKIN);
+
+            // -- Blue jacket --
+            rect(ox + 4, oy + 8, 22, 20, BLUE_SHIRT);
+            rect(ox + 6, oy + 9, 18, 18, BLUE_DARK);
+            rect(ox + 8, oy + 10, 14, 16, BLUE_SHIRT);
+            // White collar / undershirt
+            rect(ox + 11, oy + 8, 8, 4, WHITE);
+            rect(ox + 12, oy + 11, 6, 3, "#e0e0e0");
+
+            // Yellow belt area at bottom
+            rect(ox + 6, oy + 25, 18, 3, YELLOW_BELT);
+
+            // -- Left arm (raised fist) --
+            rect(ox - 2, oy + 8, 8, 6, BLUE_SHIRT);
+            rect(ox - 6, oy + 2, 7, 8, BLUE_SHIRT);
+            rect(ox - 8, oy - 2, 6, 6, BLUE_DARK);
+            // Hand / fist
+            rect(ox - 9, oy - 5, 6, 5, SKIN);
+            rect(ox - 8, oy - 6, 4, 2, SKIN);
+            rect(ox - 10, oy - 4, 2, 3, SKIN_DARK);
+
+            // -- Right arm (down, holding pokeball) --
+            rect(ox + 24, oy + 9, 7, 8, BLUE_SHIRT);
+            rect(ox + 26, oy + 16, 6, 6, SKIN);
+            // Pokeball
+            rect(ox + 24, oy + 22, 8, 8, POKEBALL_RED);
+            rect(ox + 24, oy + 26, 8, 4, POKEBALL_WHITE);
+            rect(ox + 24, oy + 25, 8, 2, POKEBALL_BLACK);
+            // Center button
+            px(ox + 27, oy + 25, WHITE);
+            px(ox + 28, oy + 25, WHITE);
+            px(ox + 27, oy + 26, POKEBALL_BLACK);
+            px(ox + 28, oy + 26, POKEBALL_BLACK);
+
+            // -- Backpack hint --
+            rect(ox + 24, oy + 8, 5, 14, "#d04040");
+            rect(ox + 25, oy + 9, 4, 12, "#b03030");
+        }
+
+        // ============ POKEBALL PLATFORM (center divider) ============
+        function drawPlatform() {
+            // Yellow rectangle on divider
+            rect(114, 150, 28, 6, DIVIDER);
+            rect(116, 151, 24, 4, DIVIDER_DARK);
+            // Small pokeball icon
+            rect(124, 152, 8, 3, POKEBALL_RED);
+            rect(124, 154, 8, 2, POKEBALL_WHITE);
+            px(127, 153, WHITE);
+            px(128, 153, WHITE);
+        }
+
+        // ============ SHADOW under Blue ============
+        function drawShadows() {
+            // Shadow under Blue
+            b.globalAlpha = 0.25;
+            rect(160, 83, 30, 5, BLACK);
+            // Shadow under Red
+            rect(25, 148, 35, 4, BLACK);
+            b.globalAlpha = 1.0;
+        }
+
+        // ============ RENDER ============
+        function render() {
+            drawShadows();
+            drawBlue();
+            drawRed();
+            drawPlatform();
+
+            // Scale up to main canvas
+            ctx.drawImage(buf, 0, 0, W * SCALE, H * SCALE);
+        }
+
+        render();
+    </script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "SeeSharp": {
+      "commandName": "Project"
+    },
+    "Container (Dockerfile)": {
+      "commandName": "Docker"
+    }
+  }
+}
