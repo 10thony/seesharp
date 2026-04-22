@@ -34,3 +34,5 @@ coverage*.xml
 .DS_Store
 Thumbs.db
 
+# Toolchain archives
+tools/wasi-sdk-25.0-x86_64-windows.tar.gz
