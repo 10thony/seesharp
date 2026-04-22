@@ -1,7 +1,8 @@
 {
   "profiles": {
     "SeeSharp": {
-      "commandName": "Project"
+      "commandName": "Project",
+      "console": "integratedTerminal"
     },
     "Container (Dockerfile)": {
       "commandName": "Docker"

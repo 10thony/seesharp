@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -20,6 +20,14 @@
 
   <ItemGroup>
     <ProjectReference Include="openai-dotnet\src\OpenAI.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Agents\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include=".github\copilot-instructions.md" />
   </ItemGroup>
 
 </Project>
