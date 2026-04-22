@@ -34,6 +34,19 @@ namespace SeeSharp.Models
             ".h"
         };
 
+        /// <summary>
+        /// Pinned first in the contextualizer’s file list so the model and fallbacks see entry points
+        /// even when the sorted walk is long.
+        /// </summary>
+        static readonly string[] s_contextualizerPinnedRelativePaths =
+        {
+            "SeeSharp.csproj",
+            "Program.cs",
+            "Models/Agent.cs",
+            "Models/ToolKit.cs",
+            "Models/AgentUtilities.cs",
+        };
+
         public static string GetChatCompletionText(ChatCompletion completion)
         {
             var sb = new StringBuilder();
@@ -67,16 +80,34 @@ namespace SeeSharp.Models
             return sb.ToString();
         }
 
-        public static List<string> ParsePickedPaths(string pickRaw, string workspaceRoot, IReadOnlyList<string> catalog)
+        public static List<string> ParsePickedPaths(
+            string pickRaw,
+            string workspaceRoot,
+            IReadOnlyList<string> catalog,
+            out string? diagnostic)
         {
+            diagnostic = null;
             var set = new HashSet<string>(catalog, StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(pickRaw))
+            {
+                diagnostic = "Pick step returned empty or whitespace-only text (no JSON to parse).";
+                return new List<string>();
+            }
+
             string json = StripMarkdownFence(pickRaw);
             try
             {
                 var dto = JsonSerializer.Deserialize<ContextualizerPickDto>(json, s_contextualizerJson);
                 if (dto?.Paths is null || dto.Paths.Count == 0)
+                {
+                    diagnostic =
+                        "JSON deserialized but \"paths\" is missing or empty. " +
+                        $"Snippet: {TruncateForLog(json, 400)}";
                     return new List<string>();
+                }
 
+                var notInCatalog = new List<string>();
+                var skippedNotUnderRoot = new List<string>();
                 var result = new List<string>();
                 foreach (string p in dto.Paths)
                 {
@@ -85,21 +116,91 @@ namespace SeeSharp.Models
 
                     string norm = p.Trim().Replace('\\', '/');
                     if (!set.Contains(norm))
+                    {
+                        // Model may name a file that was omitted from the catalog (e.g. list cap) or a new
+                        // file; accept if it is a real file under the workspace root.
+                        string absMaybe = AgentUtilities.ResolveAbsPath(norm);
+                        if (File.Exists(absMaybe)
+                            && AgentUtilities.IsPathUnderWorkspaceRoot(absMaybe, workspaceRoot))
+                        {
+                            result.Add(norm);
+                            if (result.Count >= ContextualizerMaxFilesToRead)
+                                break;
+                        }
+                        else if (notInCatalog.Count < 6)
+                        {
+                            notInCatalog.Add(norm);
+                        }
                         continue;
+                    }
 
                     string abs = AgentUtilities.ResolveAbsPath(norm);
                     if (!AgentUtilities.IsPathUnderWorkspaceRoot(abs, workspaceRoot) || !File.Exists(abs))
+                    {
+                        if (skippedNotUnderRoot.Count < 4)
+                            skippedNotUnderRoot.Add(norm);
                         continue;
+                    }
 
                     result.Add(norm);
                 }
 
+                if (result.Count == 0)
+                {
+                    diagnostic =
+                        $"Model proposed {dto.Paths.Count} path(s); none were usable. " +
+                        (notInCatalog.Count > 0
+                            ? $"Not in workspace file list (examples): {string.Join(", ", notInCatalog)}. "
+                            : "") +
+                        (skippedNotUnderRoot.Count > 0
+                            ? $"Rejected path/workspace (examples): {string.Join(", ", skippedNotUnderRoot)}. "
+                            : "") +
+                        $"Raw snippet: {TruncateForLog(json, 350)}";
+                }
+
                 return result;
             }
-            catch
+            catch (Exception ex)
             {
+                diagnostic =
+                    $"JSON parse failed: {ex.Message}. " +
+                    $"After fence strip, snippet: {TruncateForLog(json, 400)}";
                 return new List<string>();
             }
+        }
+
+        public static string TruncateForLog(string s, int maxChars)
+        {
+            if (string.IsNullOrEmpty(s))
+                return "(empty)";
+            string oneLine = s.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (oneLine.Length <= maxChars)
+                return oneLine;
+            return oneLine[..maxChars] + "…";
+        }
+
+        /// <summary>
+        /// Truncates very long file text for the small contextualizer model by keeping the
+        /// start and end (imports, type headers, and closing) so the middle can be dropped.
+        /// </summary>
+        public static string TruncateMiddleForModel(string text, int maxChars)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length <= maxChars)
+                return text;
+
+            const string gap = "\n\n[... middle of file omitted for model context size ...]\n\n";
+            if (maxChars < gap.Length + 120)
+                return text[..maxChars];
+
+            int inner = maxChars - gap.Length;
+            int headLen = (inner * 2) / 3;
+            int tailLen = inner - headLen;
+            headLen = Math.Min(headLen, text.Length);
+            tailLen = Math.Min(tailLen, Math.Max(0, text.Length - headLen));
+
+            string head = text[..headLen];
+            string tail = tailLen == 0 ? "" : text[^tailLen..];
+            return head + gap + tail;
         }
         static string StripMarkdownFence(string raw)
         {
@@ -140,6 +241,50 @@ namespace SeeSharp.Models
             }
 
             list.Sort(StringComparer.OrdinalIgnoreCase);
+            return ReorderForContextualizerFileList(list);
+        }
+
+        /// <summary>
+        /// Puts well-known project entry points at the start of the list sent to the pick model.
+        /// </summary>
+        public static List<string> ReorderForContextualizerFileList(IReadOnlyList<string> sortedRelPaths)
+        {
+            var inCatalog = new HashSet<string>(sortedRelPaths, StringComparer.OrdinalIgnoreCase);
+            var ordered = new List<string>(sortedRelPaths.Count);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string p in s_contextualizerPinnedRelativePaths)
+            {
+                if (inCatalog.Contains(p) && seen.Add(p))
+                    ordered.Add(p);
+            }
+
+            foreach (string p in sortedRelPaths)
+            {
+                if (seen.Add(p))
+                    ordered.Add(p);
+            }
+
+            return ordered;
+        }
+
+        /// <summary>
+        /// When the model’s JSON pick names paths that are not in the catalog, use a small
+        /// deterministic set of files that are actually indexed.
+        /// </summary>
+        public static List<string> GetContextualizerFallbackPicks(IReadOnlyList<string> catalog)
+        {
+            var set = new HashSet<string>(catalog, StringComparer.OrdinalIgnoreCase);
+            var list = new List<string>();
+            foreach (string p in s_contextualizerPinnedRelativePaths)
+            {
+                if (set.Contains(p))
+                {
+                    list.Add(p);
+                    if (list.Count >= ContextualizerMaxFilesToRead)
+                        break;
+                }
+            }
+
             return list;
         }
 

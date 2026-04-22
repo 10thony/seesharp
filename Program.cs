@@ -57,13 +57,16 @@ List<OpenAIModel> models = (await lmStudioModelsClient.GetModelsAsync(cts.Token)
 
 List<string> questions = new List<string>()
 {
-    "Read the Program.cs file and tell me what it does.",
-    "Edit the Agent.cs file so it is a regular class instead of an abstract class.",
+    //"Read the Program.cs file and tell me what it does.",
+    //"Edit the Agent.cs file so it is a regular class instead of an abstract class.",
     "what does cobec inc do? here is there homepage: https://www.cobec.com/",
-    "List the files in the codebase, study what there is, determine the most important files to read," +
-    " and tell me what this app does.",
-    "How can i build this program?",
-    "Study this codebase and let me know what it does."
+    //"List the files in the codebase, study what there is, determine the most important files to read," +
+    //" and tell me what this app does.",
+    //"How can i build this program?",
+    //"Study this codebase and let me know what it does." //"List the files in the codebase, study what there is, determine the most important files to read," +
+    //" and tell me what this app does.",
+    //"How can i build this program?",
+    //"Study this codebase and let me know what it does."
 };
 
 LMStudioToolKit toolKit = new LMStudioToolKit();

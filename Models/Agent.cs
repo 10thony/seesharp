@@ -3,6 +3,7 @@ using OpenAI.Models;
 using OpenAI.Responses;
 using System;
 using System.ClientModel;
+using System.ClientModel.Primitives;
 using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
@@ -25,7 +26,7 @@ namespace SeeSharp.Models
     /// each method represents an action that our agents are expected to support.
     /// e.g. 
     /// </summary>
-    public class Agent
+    public abstract class Agent
     {
         public const string DefaultContextualizerModelId = "qwen/qwen3.5-2b";
         public const string DefaultToolInvocationHandlerModel = "qwen/qwen3.5-4b";
@@ -78,11 +79,17 @@ namespace SeeSharp.Models
             }
             catch (Exception ex)
             {
-                ThemedConsole.WriteLine(TerminalTone.Error, $"[Contextualizer] Skipped: {ex.Message}");
-
+                ThemedConsole.WriteLine(TerminalTone.Error, "[Contextualizer] Exception during contextualization:");
+                ThemedConsole.WriteLine(TerminalTone.Error, FormatExceptionDetail(ex));
                 //add resiliant context generating here. if it fails we should indicate and retry atleast thrice
             }
 
+            if (string.IsNullOrEmpty(repoContext))
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error,
+                    "[Contextualizer] No repository context was produced. " +
+                    "See preceding [Contextualizer] debug lines (empty model output, bad JSON paths, or no file summaries).");
+            }
 
             sb.AppendLine($"[Contextualizer] {repoContext}");
 
@@ -99,7 +106,8 @@ namespace SeeSharp.Models
 
                 if (String.IsNullOrEmpty(repoContext))
                 {
-                    ThemedConsole.WriteLine(TerminalTone.Error, "[Contextualizer] ERROR CONTEXTUALIZING AGENT");
+                    ThemedConsole.WriteLine(TerminalTone.Error,
+                        "[Contextualizer] ERROR CONTEXTUALIZING AGENT — cannot run tasks without repo context.");
                     break;
                 }
 
@@ -231,7 +239,9 @@ namespace SeeSharp.Models
                     consecutiveAllSkippedTurns = 0;
                 }
 
-                if (consecutiveAllSkippedTurns >= 2)
+                // Two consecutive "all duplicate" turns often means the model is re-emitting the same
+                // tool: lines; require three to allow one recovery turn after a bad parse.
+                if (consecutiveAllSkippedTurns >= 3)
                 {
                     return "Stopped: the model requested only duplicate tools already run this task. " +
                         "Use the tool JSON already returned in the conversation to answer, or state what is blocking you.";
@@ -260,10 +270,37 @@ namespace SeeSharp.Models
                     turnNumberOneBased: turn + 1,
                     successfulToolExecutions,
                     allSkippedThisTurn,
+                    seenToolsBridgeHint: BuildSeenToolsBridgeHint(seenToolSignatures),
                     cancellationToken).ConfigureAwait(false);
             }
 
             return "Stopped after max turns while resolving tool calls.";
+        }
+
+        private static string BuildSeenToolsBridgeHint(HashSet<string> seenToolSignatures)
+        {
+            if (seenToolSignatures.Count == 0)
+            {
+                return "";
+            }
+
+            var webUrls = new List<string>();
+            const string webPrefix = "WEB_CALL::";
+            foreach (string s in seenToolSignatures)
+            {
+                if (s.Length > webPrefix.Length && s.StartsWith(webPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    webUrls.Add(s[webPrefix.Length..]);
+                }
+            }
+
+            if (webUrls.Count == 0)
+            {
+                return "";
+            }
+
+            return "Already-fetched WEB_CALL URLs (do not request these again with tool:): " +
+                string.Join("; ", webUrls);
         }
 
         private static string BuildToolInvocationSignature(string toolName, Dictionary<string, object?> args)
@@ -581,6 +618,7 @@ namespace SeeSharp.Models
             int turnNumberOneBased,
             int successfulToolExecutions,
             bool allSkippedThisTurn,
+            string? seenToolsBridgeHint,
             CancellationToken cancellationToken)
         {
             _ = responsesClient;
@@ -602,7 +640,12 @@ namespace SeeSharp.Models
                 $"(budget {MaxSuccessfulToolExecutionsPerTask}).");
             nextInput.AppendLine("Be frugal: prefer one well-chosen tool per turn. Do not repeat listing the repo, " +
                 "re-read the same file, or issue overlapping find/dir/Get-ChildItem variants for the same purpose.");
-            nextInput.AppendLine("For WEB_CALL, usually one primary page is enough unless the first body clearly lacks the answer.");
+            nextInput.AppendLine("For WEB_CALL: if you already fetched a URL in this task, do not request it again; " +
+                "answer from the JSON you have, or fetch a *different* URL only if the first page truly lacks the answer.");
+            if (!string.IsNullOrWhiteSpace(seenToolsBridgeHint))
+            {
+                nextInput.AppendLine(seenToolsBridgeHint);
+            }
             if (successfulToolExecutions >= 10)
             {
                 nextInput.AppendLine("You have already run many tools; strongly prefer a final answer now unless one specific fact is still missing.");
@@ -613,8 +656,8 @@ namespace SeeSharp.Models
                 nextInput.AppendLine();
                 nextInput.AppendLine(
                     "IMPORTANT: Every tool call in this round was skipped as a duplicate of an earlier run. " +
-                    "Do not emit those same tools again. Answer from the JSON already in this thread, " +
-                    "or explain what is still unknown without re-running identical commands.");
+                    "Your **next** message must be a normal answer (no tool: lines) using the tool results below, " +
+                    "unless you need a genuinely *new* URL or command you have not used before this task.");
             }
 
             nextInput.AppendLine();
@@ -684,27 +727,92 @@ namespace SeeSharp.Models
             return sb.ToString();
         }
 
+        private static string FormatExceptionDetail(Exception ex)
+        {
+            var sb = new StringBuilder();
+            int depth = 0;
+            for (Exception? e = ex; e is not null; e = e.InnerException)
+            {
+                if (depth++ > 0)
+                    sb.AppendLine("--- Inner exception ---");
+                sb.AppendLine($"{e.GetType().FullName}: {e.Message}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(ex.StackTrace))
+            {
+                sb.AppendLine("Stack trace:");
+                sb.AppendLine(ex.StackTrace);
+            }
+
+            return sb.ToString().TrimEnd();
+        }
+
         private static bool IsContextWindowExceeded(Exception ex)
         {
             for (Exception? current = ex; current is not null; current = current.InnerException)
             {
-                string message = current.Message ?? "";
-                if (message.Contains("n_keep", StringComparison.OrdinalIgnoreCase) ||
-                    message.Contains("n_ctx", StringComparison.OrdinalIgnoreCase) ||
-                    message.Contains("context length", StringComparison.OrdinalIgnoreCase) ||
-                    message.Contains("context window", StringComparison.OrdinalIgnoreCase) ||
-                    message.Contains("token limit", StringComparison.OrdinalIgnoreCase))
+                if (TextIndicatesLlmContextLimit(current.Message))
                 {
                     return true;
                 }
             }
 
+            if (ex is ClientResultException cre
+                && TextIndicatesLlmContextLimit(TryGetClientErrorBodyString(cre)))
+            {
+                return true;
+            }
+
             return false;
+        }
+
+        private static bool TextIndicatesLlmContextLimit(string? text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return false;
+            }
+
+            return text.Contains("n_keep", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("n_ctx", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("context length", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("context window", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("token limit", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("larger context", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? TryGetClientErrorBodyString(ClientResultException ex)
+        {
+            try
+            {
+                PipelineResponse? raw = ex.GetRawResponse();
+                raw?.BufferContent();
+                if (raw?.Content is { Length: > 0 } bd)
+                {
+                    return bd.ToString();
+                }
+            }
+            catch
+            {
+            }
+
+            return null;
         }
 
         const int ContextualizerMaxListLines = 2500;
         const int ContextualizerMaxFilesToRead = 15;
         const int ContextualizerMaxCharsPerFile = 48_000;
+        /// <summary>Pick step: huge repo lists can exceed local server limits.</summary>
+        const int ContextualizerMaxPickUserChars = 120_000;
+        /// <summary>Per-file summary: the full user message (path + file body) for /v1/chat/completions.
+        /// Kept moderate so system + user stay under small local n_ctx (e.g. 4096).</summary>
+        const int ContextualizerMaxSummaryUserChars = 4_000;
+        /// <summary>Merge step: combined per-file notes.</summary>
+        const int ContextualizerMaxMergeUserChars = 12_000;
+        /// <summary>When the server says n_keep/n_ctx exceeded, force the next attempt this small (chars in user only).</summary>
+        const int ContextualizerNCtxRetryTargetUserChars = 2_200;
+        const int ContextualizerHttpRetryMaxAttempts = 6;
+        const int ContextualizerHttpRetryMinUserChars = 500;
         static readonly JsonSerializerOptions s_contextualizerJson = new() 
         { PropertyNameCaseInsensitive = true };
 
@@ -713,21 +821,39 @@ namespace SeeSharp.Models
             CancellationToken cancellationToken)
         {
             if (_contextualizerChatClient is null)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error,
+                    "[Contextualizer] Chat client is null; contextualization is disabled.");
                 return "";
+            }
 
             IReadOnlyList<string> allRelPaths = AgentUtilities.ListWorkspaceSourceFilesRelative();
-            if (allRelPaths.Count == 0)
-                return "";
-
             string workspaceRoot = AgentUtilities.ResolveWorkspaceRoot();
+            ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                $"[Contextualizer] Workspace root: {workspaceRoot}; indexed source files: {allRelPaths.Count}");
+
+            if (allRelPaths.Count == 0)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error,
+                    "[Contextualizer] No workspace source files found (empty listing). " +
+                    "Check HARNESS_WORKSPACE_ROOT / working directory and exclude rules in AgentUtilities.");
+                return "";
+            }
+
             string listBlock = AgentUtilities.BuildFileListUserBlock(allRelPaths, userTask);
 
             string pickRelevantFilesUserMessage = 
                 "You choose which source files matter for understanding this repository." +
                 " Reply with a single JSON object only, no markdown, no explanation. " +
                 " Schema: {\"paths\":[\"relative/path.cs\",...]} with at most 15 paths." +
-                " Prefer: *.csproj, Program.cs, entry points, core Models/, README, and" +
-                " files most relevant to the user's task if given. Use forward slashes as in the list.";
+                " CRITICAL: Every string in \"paths\" MUST be copied EXACTLY from the file list below " +
+                "(including folder names). Do not reference README.md, LICENSE, or other common names" +
+                " unless that exact line appears in the list — many projects omit them, and" +
+                " some folders (e.g. third-party) are not listed." +
+                " Prefer: entries near the top of the list (entry points, *.csproj, Program.cs, core Models/)," +
+                " and paths most relevant to the user's task. " +
+                "Favor a smaller, high-signal set (e.g. project file, program entry, core abstractions) over" +
+                " long lists of similar files. Use forward slashes as in the list.";
 
             string summarizeFileUserMessage = 
                 "Summarize the important information in this file for a coding assistant. Focus on facts," +
@@ -739,15 +865,46 @@ namespace SeeSharp.Models
                 "Merge the following per-file notes into one concise repository overview for " +
                 "the main coding assistant. Keep facts only; max ~20 lines. No preamble.";
 
-            string pickRaw = await CompleteContextualizerChatAsync(
-               pickRelevantFilesUserMessage,
+            var pickOptions = new ChatCompletionOptions { Temperature = 0.2f, MaxOutputTokenCount = 1024 };
+            string pickRaw = await CompleteContextualizerChatWithRetriesAsync(
+                pickRelevantFilesUserMessage,
                 listBlock,
-                new ChatCompletionOptions { Temperature = 0.2f, MaxOutputTokenCount = 1024 },
-                cancellationToken).ConfigureAwait(false);
+                pickOptions,
+                cancellationToken,
+                "pick (choose files)",
+                ContextualizerMaxPickUserChars).ConfigureAwait(false);
 
-            List<string> picked = AgentUtilities.ParsePickedPaths(pickRaw, workspaceRoot, allRelPaths);
+            ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                $"[Contextualizer] Pick-step raw length={pickRaw?.Length ?? 0}. " +
+                $"Preview: {AgentUtilities.TruncateForLog(pickRaw ?? "", 500)}");
+
+            List<string> picked = AgentUtilities.ParsePickedPaths(
+                pickRaw ?? "",
+                workspaceRoot,
+                allRelPaths,
+                out string? pickDiagnostic);
             if (picked.Count == 0)
-                return "";
+            {
+                if (!string.IsNullOrEmpty(pickDiagnostic))
+                    ThemedConsole.WriteLine(TerminalTone.Error, "[Contextualizer] " + pickDiagnostic);
+                List<string> fallbackPicks = AgentUtilities.GetContextualizerFallbackPicks(allRelPaths);
+                if (fallbackPicks.Count > 0)
+                {
+                    ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                        "[Contextualizer] Model pick failed; using fallback entry-point files: " +
+                        string.Join(", ", fallbackPicks));
+                    picked = fallbackPicks;
+                }
+                else
+                {
+                    ThemedConsole.WriteLine(TerminalTone.Error,
+                        "[Contextualizer] Path pick produced zero usable files and no fallback candidates exist.");
+                    return "";
+                }
+            }
+
+            ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                $"[Contextualizer] Picked {picked.Count} file(s): {string.Join(", ", picked)}");
 
             var perFileSummaries = new List<string>(picked.Count);
             foreach (string rel in picked)
@@ -760,6 +917,8 @@ namespace SeeSharp.Models
 
                 if (!readResult.TryGetValue("content", out object? contentObj) || contentObj is null)
                 {
+                    ThemedConsole.WriteLine(TerminalTone.Error,
+                        $"[Contextualizer] ReadFile_Tool returned no content for '{rel}' (keys: {string.Join(", ", readResult.Keys)}).");
                     continue;
                 }
 
@@ -770,33 +929,109 @@ namespace SeeSharp.Models
                 }
 
                 string user = "File: " + rel + "\n\n" + content;
-                string summary = await CompleteContextualizerChatAsync(
+                user = AgentUtilities.TruncateMiddleForModel(user, ContextualizerMaxSummaryUserChars);
+                string summary = await CompleteContextualizerChatWithRetriesAsync(
                     summarizeFileUserMessage,
                     user,
                     new ChatCompletionOptions { Temperature = 0.35f, MaxOutputTokenCount = 768 },
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken,
+                    $"summarize: {rel}",
+                    ContextualizerMaxSummaryUserChars).ConfigureAwait(false);
 
-                if (!string.IsNullOrWhiteSpace(summary))
+                if (string.IsNullOrWhiteSpace(summary))
+                {
+                    ThemedConsole.WriteLine(TerminalTone.Error,
+                        $"[Contextualizer] Empty summary for '{rel}' after summarize step.");
+                }
+                else
+                {
                     perFileSummaries.Add($"### {rel}\n{summary.Trim()}");
+                }
             }
 
             if (perFileSummaries.Count == 0)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error,
+                    "[Contextualizer] No per-file summaries were collected (all reads failed or all summaries empty).");
                 return "";
+            }
 
             string mergeUser = string.Join("\n\n", perFileSummaries);
-            string merged = await CompleteContextualizerChatAsync(
+            mergeUser = AgentUtilities.TruncateMiddleForModel(mergeUser, ContextualizerMaxMergeUserChars);
+            string merged = await CompleteContextualizerChatWithRetriesAsync(
                 mergeContextTogetherUserMessage,
                 mergeUser,
                 new ChatCompletionOptions { Temperature = 0.2f, MaxOutputTokenCount = 2048 },
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                "merge (final overview)",
+                ContextualizerMaxMergeUserChars).ConfigureAwait(false);
+
+            if (string.IsNullOrWhiteSpace(merged))
+            {
+                merged = BuildUnmergedContextFallback(perFileSummaries);
+                if (string.IsNullOrWhiteSpace(merged))
+                {
+                    ThemedConsole.WriteLine(TerminalTone.Error,
+                        "[Contextualizer] Merge step failed and unmerged fallback is empty.");
+                    return "";
+                }
+
+                ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                    "[Contextualizer] Using unmerged per-file notes as repo context (merge call failed or returned empty).");
+            }
 
             return merged.Trim();
         }
-        async Task<string> CompleteContextualizerChatAsync(
+
+        static string BuildUnmergedContextFallback(IReadOnlyList<string> perFileSummaries)
+        {
+            if (perFileSummaries is null || perFileSummaries.Count == 0)
+                return "";
+            const int max = 50_000;
+            string body = "Repository context (unmerged; merge did not return text):\n\n" +
+                string.Join("\n\n", perFileSummaries);
+            return body.Length > max
+                ? AgentUtilities.TruncateMiddleForModel(body, max)
+                : body;
+        }
+
+        private static bool IsRetryableContextualizerRequest(ClientResultException ex) =>
+            ex.Status is 400 or 413 or 429 or 500 or 502 or 503;
+
+        private static void LogContextualizerClientFailure(string step, Exception ex)
+        {
+            if (ex is ClientResultException cre)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error,
+                    $"[Contextualizer] {step}: HTTP {cre.Status} — {cre.Message}");
+                try
+                {
+                    PipelineResponse? raw = cre.GetRawResponse();
+                    raw?.BufferContent();
+                    if (raw?.Content is { Length: > 0 } bd)
+                    {
+                        string s = bd.ToString();
+                        if (s.Length > 1800)
+                            s = s[..1800] + "…";
+                        ThemedConsole.WriteLine(TerminalTone.Error, "[Contextualizer] Server response body: " + s);
+                    }
+                }
+                catch
+                {
+                }
+            }
+            else
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error, $"[Contextualizer] {step}: {ex.Message}");
+            }
+        }
+
+        private async Task<string> CompleteContextualizerSingleChatAsync(
             string system,
             string user,
             ChatCompletionOptions options,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string step)
         {
             if (_contextualizerChatClient is null)
                 return "";
@@ -807,16 +1042,100 @@ namespace SeeSharp.Models
                 new UserChatMessage(user)
             ];
 
-            ClientResult<ChatCompletion> clientResult =
-                await _contextualizerChatClient.CompleteChatAsync(messages, options, cancellationToken).ConfigureAwait(false);
+            ClientResult<ChatCompletion> clientResult = await _contextualizerChatClient
+                .CompleteChatAsync(messages, options, cancellationToken)
+                .ConfigureAwait(false);
             ChatCompletion completion = clientResult.Value;
 
             if (completion.FinishReason != ChatFinishReason.Stop)
             {
-                ThemedConsole.WriteLine(TerminalTone.Error, $"[Contextualizer] finish_reason={completion.FinishReason}");
+                ThemedConsole.WriteLine(TerminalTone.Error,
+                    $"[Contextualizer] {step}: finish_reason={completion.FinishReason} (content may be partial or empty).");
             }
 
-            return AgentUtilities.GetChatCompletionText(completion);
+            string text = AgentUtilities.GetChatCompletionText(completion);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error,
+                    $"[Contextualizer] {step}: no text in completion (finish_reason={completion.FinishReason}).");
+            }
+
+            return text;
+        }
+
+        /// <summary>
+        /// LM Studio and small local models often return 400 when the request body is too large.
+        /// Pre-truncates to <paramref name="preTruncateUserToMaxChars"/> and halves the user
+        /// message on retryable HTTP errors.
+        /// </summary>
+        private async Task<string> CompleteContextualizerChatWithRetriesAsync(
+            string system,
+            string user,
+            ChatCompletionOptions options,
+            CancellationToken cancellationToken,
+            string step,
+            int preTruncateUserToMaxChars)
+        {
+            if (_contextualizerChatClient is null)
+                return "";
+
+            if (user.Length > preTruncateUserToMaxChars)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                    $"[Contextualizer] {step}: pre-shrinking user message {user.Length} → {preTruncateUserToMaxChars} chars");
+                user = AgentUtilities.TruncateMiddleForModel(user, preTruncateUserToMaxChars);
+            }
+
+            string current = user;
+            for (int attempt = 0; attempt < ContextualizerHttpRetryMaxAttempts; attempt++)
+            {
+                try
+                {
+                    return await CompleteContextualizerSingleChatAsync(
+                        system,
+                        current,
+                        options,
+                        cancellationToken,
+                        step).ConfigureAwait(false);
+                }
+                catch (ClientResultException ex) when (IsRetryableContextualizerRequest(ex)
+                    && current.Length > ContextualizerHttpRetryMinUserChars)
+                {
+                    LogContextualizerClientFailure($"{step} (attempt {attempt + 1})", ex);
+                    string? errBody = TryGetClientErrorBodyString(ex);
+                    bool nCtxPromptTooLarge = TextIndicatesLlmContextLimit(errBody);
+                    if (nCtxPromptTooLarge)
+                    {
+                        int cap = Math.Min(current.Length, ContextualizerNCtxRetryTargetUserChars);
+                        cap = Math.Max(ContextualizerHttpRetryMinUserChars, cap);
+                        current = AgentUtilities.TruncateMiddleForModel(current, cap) +
+                            "\n\n[... truncated for local model n_ctx / n_keep limit ...]\n";
+                        ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                            $"[Contextualizer] {step}: n_ctx/n_keep limit in server body; retrying with ~{current.Length} user chars " +
+                            "(raise LM Studio context length or use a larger contextualizer model if this persists).");
+                    }
+                    else
+                    {
+                        int n = Math.Max(
+                            ContextualizerHttpRetryMinUserChars,
+                            (current.Length * 1) / 2);
+                        current = current[..n] + "\n\n[... truncated for server limits after HTTP error ...]\n";
+                        ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                            $"[Contextualizer] {step}: retrying with ~{current.Length} chars in user message");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogContextualizerClientFailure(step, ex);
+                    if (ex is not ClientResultException)
+                        ThemedConsole.WriteLine(TerminalTone.Error, FormatExceptionDetail(ex));
+                    return "";
+                }
+            }
+
+            ThemedConsole.WriteLine(TerminalTone.Error,
+                $"[Contextualizer] {step}: request failed after {ContextualizerHttpRetryMaxAttempts} attempt(s) with a retryable error.");
+            return "";
         }
 
         private sealed class ContextualizerPickDto
@@ -841,7 +1160,8 @@ namespace SeeSharp.Models
             sb.AppendLine("- Default to at most ONE tool: line per reply. Use two only if you must touch two different resources in parallel.");
             sb.AppendLine("- Do not repeat the same exploration pattern (e.g. multiple ls/dir/Get-ChildItem/find variants for the same directory).");
             sb.AppendLine("- Do not re-read the same file path in one task unless the first read failed, was empty, or was clearly truncated.");
-            sb.AppendLine("- For WEB_CALL: start with one canonical URL (often the homepage). Add a second fetch only if the first page does not contain the answer.");
+            sb.AppendLine("- For WEB_CALL: start with one canonical URL (often the homepage). Add a different URL only if the first page does not contain the answer.");
+            sb.AppendLine("- Never emit a tool: line for a WEB_CALL URL you already successfully fetched in this task; the host will skip it as a duplicate.");
             sb.AppendLine("- When tool JSON already answers the user, respond in plain language with NO tool: line.");
             sb.AppendLine();
             sb.AppendLine("TOOL TURNS: tool requests must be one or more lines that each start with " +
