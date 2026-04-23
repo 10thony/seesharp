@@ -14,23 +14,29 @@ namespace SeeSharp.Models
             public List<string>? Paths { get; set; }
         }
 
-        static string _relativePathBase = ResolveWorkspaceRoot();
         public const int ContextualizerMaxListLines = 2500;
         public const int ContextualizerMaxFilesToRead = 15;
         public const int ContextualizerMaxCharsPerFile = 48_000;
         public static readonly JsonSerializerOptions s_contextualizerJson = new()
         { PropertyNameCaseInsensitive = true };
 
-        static readonly HashSet<string> s_workspaceWalkExcludedDirs = new(StringComparer.OrdinalIgnoreCase)
+        static readonly HashSet<string> s_workspaceWalkExcludedDirs = 
+            new(StringComparer.OrdinalIgnoreCase)
         {
             "bin", "obj", ".git", ".vs", ".idea", "node_modules", "openai-dotnet",
             ".dockerignore","tools"
         };
 
-        static readonly HashSet<string> s_workspaceWalkSkippedExtensions = new(StringComparer.OrdinalIgnoreCase)
+        static readonly HashSet<string> s_workspaceWalkSkippedExtensions = 
+            new(StringComparer.OrdinalIgnoreCase)
         {
-            ".dll", ".exe", ".pdb", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".zip",
-            ".7z", ".tar", ".gz", ".pdf", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".user",
+            ".dll", ".exe", ".pdb",
+            ".png", ".jpg", ".jpeg",
+            ".gif", ".webp", ".ico", 
+            ".zip",".7z", ".tar", 
+            ".gz",".pdf", ".woff", 
+            ".woff2", ".ttf", ".eot", 
+            ".mp4",".mp3", ".user",
             ".h"
         };
 
@@ -68,7 +74,8 @@ namespace SeeSharp.Models
             for (int i = 0; i < n; i++)
                 sb.AppendLine(allRelPaths[i]);
             if (allRelPaths.Count > ContextualizerMaxListLines)
-                sb.AppendLine($"... and {allRelPaths.Count - ContextualizerMaxListLines} more paths not shown.");
+                sb.AppendLine($"... and {allRelPaths.Count - ContextualizerMaxListLines}" +
+                    $" more paths not shown.");
 
             if (!string.IsNullOrWhiteSpace(userTask))
             {
@@ -90,14 +97,17 @@ namespace SeeSharp.Models
             var set = new HashSet<string>(catalog, StringComparer.OrdinalIgnoreCase);
             if (string.IsNullOrWhiteSpace(pickRaw))
             {
-                diagnostic = "Pick step returned empty or whitespace-only text (no JSON to parse).";
+                diagnostic = "Pick step returned empty or whitespace-only text " +
+                    "(no JSON to parse).";
                 return new List<string>();
             }
 
             string json = StripMarkdownFence(pickRaw);
             try
             {
-                var dto = JsonSerializer.Deserialize<ContextualizerPickDto>(json, s_contextualizerJson);
+                var dto = JsonSerializer.Deserialize<ContextualizerPickDto>
+                    (json, s_contextualizerJson);
+
                 if (dto?.Paths is null || dto.Paths.Count == 0)
                 {
                     diagnostic =
@@ -111,7 +121,8 @@ namespace SeeSharp.Models
                 var result = new List<string>();
                 foreach (string p in dto.Paths)
                 {
-                    if (string.IsNullOrWhiteSpace(p) || result.Count >= ContextualizerMaxFilesToRead)
+                    if (string.IsNullOrWhiteSpace(p) || 
+                        result.Count >= ContextualizerMaxFilesToRead)
                         break;
 
                     string norm = p.Trim().Replace('\\', '/');
@@ -120,8 +131,8 @@ namespace SeeSharp.Models
                         // Model may name a file that was omitted from the catalog (e.g. list cap) or a new
                         // file; accept if it is a real file under the workspace root.
                         string absMaybe = AgentUtilities.ResolveAbsPath(norm);
-                        if (File.Exists(absMaybe)
-                            && AgentUtilities.IsPathUnderWorkspaceRoot(absMaybe, workspaceRoot))
+                        if (File.Exists(absMaybe) && 
+                            AgentUtilities.IsPathUnderWorkspaceRoot(absMaybe, workspaceRoot))
                         {
                             result.Add(norm);
                             if (result.Count >= ContextualizerMaxFilesToRead)
@@ -135,7 +146,8 @@ namespace SeeSharp.Models
                     }
 
                     string abs = AgentUtilities.ResolveAbsPath(norm);
-                    if (!AgentUtilities.IsPathUnderWorkspaceRoot(abs, workspaceRoot) || !File.Exists(abs))
+                    if (!AgentUtilities.IsPathUnderWorkspaceRoot(abs, workspaceRoot) || 
+                        !File.Exists(abs))
                     {
                         if (skippedNotUnderRoot.Count < 4)
                             skippedNotUnderRoot.Add(norm);
@@ -150,10 +162,12 @@ namespace SeeSharp.Models
                     diagnostic =
                         $"Model proposed {dto.Paths.Count} path(s); none were usable. " +
                         (notInCatalog.Count > 0
-                            ? $"Not in workspace file list (examples): {string.Join(", ", notInCatalog)}. "
+                            ? $"Not in workspace file list (examples): " +
+                            $"{string.Join(", ", notInCatalog)}. "
                             : "") +
                         (skippedNotUnderRoot.Count > 0
-                            ? $"Rejected path/workspace (examples): {string.Join(", ", skippedNotUnderRoot)}. "
+                            ? $"Rejected path/workspace (examples): " +
+                            $"{string.Join(", ", skippedNotUnderRoot)}. "
                             : "") +
                         $"Raw snippet: {TruncateForLog(json, 350)}";
                 }
@@ -187,7 +201,7 @@ namespace SeeSharp.Models
         {
             if (string.IsNullOrEmpty(text) || text.Length <= maxChars)
                 return text;
-
+            
             const string gap = "\n\n[... middle of file omitted for model context size ...]\n\n";
             if (maxChars < gap.Length + 120)
                 return text[..maxChars];
@@ -290,7 +304,8 @@ namespace SeeSharp.Models
 
         static bool ShouldSkipWorkspaceRelativePath(string relativePath)
         {
-            foreach (string segment in relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+            foreach (string segment in relativePath.Split(Path.DirectorySeparatorChar,
+                Path.AltDirectorySeparatorChar))
             {
                 if (string.IsNullOrEmpty(segment))
                     continue;
@@ -306,10 +321,14 @@ namespace SeeSharp.Models
         /// </summary>
         public static bool IsPathUnderWorkspaceRoot(string absolutePath, string workspaceRoot)
         {
-            string root = Path.GetFullPath(workspaceRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            string abs = Path.GetFullPath(absolutePath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string root = Path.GetFullPath(workspaceRoot).TrimEnd(Path.DirectorySeparatorChar, 
+                Path.AltDirectorySeparatorChar);
+            string abs = Path.GetFullPath(absolutePath).TrimEnd(Path.DirectorySeparatorChar, 
+                Path.AltDirectorySeparatorChar);
+
             if (string.Equals(abs, root, StringComparison.OrdinalIgnoreCase))
                 return true;
+
             return abs.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
                 || abs.StartsWith(root + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
         }
@@ -349,7 +368,7 @@ namespace SeeSharp.Models
 
             if (!Path.IsPathRooted(pathStr))
             {
-                pathStr = Path.GetFullPath(Path.Combine(_relativePathBase, pathStr));
+                pathStr = Path.GetFullPath(Path.Combine(ResolveWorkspaceRoot(), pathStr));
             }
             else
             {

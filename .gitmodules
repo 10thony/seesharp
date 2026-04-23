@@ -1,3 +1,0 @@
-[submodule "openai-dotnet"]
-	path = openai-dotnet
-	url = https://github.com/openai/openai-dotnet.git

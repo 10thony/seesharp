@@ -7,19 +7,15 @@
     <Nullable>enable</Nullable>
     <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
     <DockerfileContext>.</DockerfileContext>
-    <!-- Submodule contains doc snippets as .cs files; do not compile them into this app. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);openai-dotnet\**\*.cs</DefaultItemExcludes>
-    <!-- Responses API is marked experimental in openai-dotnet (OPENAI001). -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);test-projects\**\*.cs</DefaultItemExcludes>
+    <!-- Responses API is marked experimental in the OpenAI .NET package (OPENAI001). -->
     <NoWarn>$(NoWarn);OPENAI001</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.23.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="openai-dotnet\src\OpenAI.csproj" />
+    <PackageReference Include="OpenAI" Version="2.10.0" />
   </ItemGroup>
 
   <ItemGroup>

@@ -9,6 +9,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace SeeSharp.Models
 {
@@ -154,12 +155,27 @@ namespace SeeSharp.Models
                 CreateResponseResult assistantResponse;
                 try
                 {
-                    assistantResponse = await CreateResponseWithRetryAsync(
-                        modelId: this.Model.Id,
-                        input: currentInput,
-                        lmStudioResponsesClient: responsesClient,
-                        repoContext: perTurnRepoContext,
-                        cancellation: cancellationToken).ConfigureAwait(false);
+                    assistantResponse = await WithPerCallTimeoutAndTelemetryAsync(
+                        "[Agent] main model",
+                        TerminalTone.Reasoning,
+                        AgentDefaults.ResponsesApiCallTimeout,
+                        ct => CreateResponseWithRetryAsync(
+                            modelId: this.Model.Id,
+                            input: currentInput,
+                            lmStudioResponsesClient: responsesClient,
+                            repoContext: perTurnRepoContext,
+                            cancellation: ct),
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+
+                    ThemedConsole.WriteLine(TerminalTone.Error, "[Agent] Main model request timed out.");
+                    return "Stopped: the model did not respond within the per-request time limit.";
                 }
                 catch (Exception ex) when (IsContextWindowExceeded(ex) && !hasContextResetAttempted)
                 {
@@ -178,13 +194,28 @@ namespace SeeSharp.Models
                 }
                 lastAssistantText = assistantText;
 
-                List<(string toolName, Dictionary<string, object?> args)> invocations =
-                    await ParseToolInvocationsWithSmallModelAsync(
+                List<(string toolName, Dictionary<string, object?> args)> invocations;
+                try
+                {
+                    invocations = await ParseToolInvocationsWithSmallModelAsync(
                         responsesClient,
                         task,
                         repoContext,
                         assistantText,
                         cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+
+                    ThemedConsole.WriteLine(
+                        TerminalTone.Error,
+                        "[Agent] Tool-call parser model request timed out.");
+                    return "Stopped: the tool parser did not respond within the per-request time limit.";
+                }
 
                 if (invocations.Count == 0)
                 {
@@ -275,6 +306,82 @@ namespace SeeSharp.Models
             }
 
             return "Stopped after max turns while resolving tool calls.";
+        }
+
+        private static async Task LlmProgressLoopAsync(
+            TerminalTone tone,
+            string messagePrefix,
+            DateTime startUtc,
+            TimeSpan maxDuration,
+            CancellationToken telemetryStopToken,
+            CancellationToken requestToken)
+        {
+            while (!telemetryStopToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(AgentDefaults.LlmTelemetryInterval, telemetryStopToken)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                if (requestToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                double elapsed = (DateTime.UtcNow - startUtc).TotalSeconds;
+                ThemedConsole.WriteLine(
+                    tone,
+                    $"{messagePrefix} still waiting for model… ({elapsed:F0}s / {maxDuration.TotalMinutes:F0}m max)");
+            }
+        }
+
+        private async Task<T> WithPerCallTimeoutAndTelemetryAsync<T>(
+            string messagePrefix,
+            TerminalTone tone,
+            TimeSpan perCallTimeout,
+            Func<CancellationToken, Task<T>> operation,
+            CancellationToken outerCancellation,
+            bool logCompletionDuration = true)
+        {
+            using CancellationTokenSource timeoutCts = new(perCallTimeout);
+            using CancellationTokenSource linkedCts = CancellationTokenSource
+                .CreateLinkedTokenSource(outerCancellation, timeoutCts.Token);
+            CancellationToken linked = linkedCts.Token;
+            DateTime start = DateTime.UtcNow;
+            ThemedConsole.WriteLine(tone, $"{messagePrefix} (max {perCallTimeout.TotalMinutes:F0}m)…");
+            using CancellationTokenSource telemetryCts = new();
+            Task telemetryTask = Task.Run(
+                () => LlmProgressLoopAsync(
+                    tone, messagePrefix, start, perCallTimeout, telemetryCts.Token, linked),
+                CancellationToken.None);
+            try
+            {
+                T result = await operation(linked).ConfigureAwait(false);
+                if (logCompletionDuration)
+                {
+                    ThemedConsole.WriteLine(
+                        tone,
+                        $"{messagePrefix} completed in {(DateTime.UtcNow - start).TotalSeconds:F1}s");
+                }
+
+                return result;
+            }
+            finally
+            {
+                telemetryCts.Cancel();
+                try
+                {
+                    await telemetryTask.ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+            }
         }
 
         private static string BuildSeenToolsBridgeHint(HashSet<string> seenToolSignatures)
@@ -452,12 +559,17 @@ namespace SeeSharp.Models
             parserPrompt.AppendLine("Assistant text:");
             parserPrompt.AppendLine(assistantText);
 
-            CreateResponseResult parsed = await CreateResponseWithRetryAsync(
-                modelId: DefaultToolInvocationHandlerModel,
-                input: parserPrompt.ToString(),
-                lmStudioResponsesClient: responsesClient,
-                repoContext: repoContext,
-                cancellation: cancellationToken).ConfigureAwait(false);
+            CreateResponseResult parsed = await WithPerCallTimeoutAndTelemetryAsync(
+                "[Agent] tool-call parser",
+                TerminalTone.Reasoning,
+                AgentDefaults.ResponsesApiCallTimeout,
+                ct => CreateResponseWithRetryAsync(
+                    modelId: DefaultToolInvocationHandlerModel,
+                    input: parserPrompt.ToString(),
+                    lmStudioResponsesClient: responsesClient,
+                    repoContext: repoContext,
+                    cancellation: ct),
+                cancellationToken).ConfigureAwait(false);
 
             string json = parsed.ResponseContentText?.Trim() ?? "";
             List<(string toolName, Dictionary<string, object?> args)> parsedCalls =
@@ -1036,31 +1148,40 @@ namespace SeeSharp.Models
             if (_contextualizerChatClient is null)
                 return "";
 
-            List<ChatMessage> messages =
-            [
-                new SystemChatMessage(system),
-                new UserChatMessage(user)
-            ];
+            return await WithPerCallTimeoutAndTelemetryAsync(
+                $"[Contextualizer] {step}",
+                TerminalTone.Reasoning,
+                AgentDefaults.ContextualizerCallTimeout,
+                async linkedCt =>
+                {
+                    List<ChatMessage> messages =
+                    [
+                        new SystemChatMessage(system),
+                        new UserChatMessage(user)
+                    ];
 
-            ClientResult<ChatCompletion> clientResult = await _contextualizerChatClient
-                .CompleteChatAsync(messages, options, cancellationToken)
-                .ConfigureAwait(false);
-            ChatCompletion completion = clientResult.Value;
+                    ClientResult<ChatCompletion> clientResult = await _contextualizerChatClient
+                        .CompleteChatAsync(messages, options, linkedCt)
+                        .ConfigureAwait(false);
+                    ChatCompletion completion = clientResult.Value;
 
-            if (completion.FinishReason != ChatFinishReason.Stop)
-            {
-                ThemedConsole.WriteLine(TerminalTone.Error,
-                    $"[Contextualizer] {step}: finish_reason={completion.FinishReason} (content may be partial or empty).");
-            }
+                    if (completion.FinishReason != ChatFinishReason.Stop)
+                    {
+                        ThemedConsole.WriteLine(TerminalTone.Error,
+                            $"[Contextualizer] {step}: finish_reason={completion.FinishReason} (content may be partial or empty).");
+                    }
 
-            string text = AgentUtilities.GetChatCompletionText(completion);
-            if (string.IsNullOrWhiteSpace(text))
-            {
-                ThemedConsole.WriteLine(TerminalTone.Error,
-                    $"[Contextualizer] {step}: no text in completion (finish_reason={completion.FinishReason}).");
-            }
+                    string text = AgentUtilities.GetChatCompletionText(completion);
+                    if (string.IsNullOrWhiteSpace(text))
+                    {
+                        ThemedConsole.WriteLine(TerminalTone.Error,
+                            $"[Contextualizer] {step}: no text in completion (finish_reason={completion.FinishReason}).");
+                    }
 
-            return text;
+                    return text;
+                },
+                cancellationToken,
+                logCompletionDuration: false).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -1097,6 +1218,17 @@ namespace SeeSharp.Models
                         options,
                         cancellationToken,
                         step).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (OperationCanceledException)
+                {
+                    ThemedConsole.WriteLine(
+                        TerminalTone.Error,
+                        $"[Contextualizer] {step}: request timed out after {AgentDefaults.ContextualizerCallTimeout.TotalMinutes:F0}m.");
+                    return "";
                 }
                 catch (ClientResultException ex) when (IsRetryableContextualizerRequest(ex)
                     && current.Length > ContextualizerHttpRetryMinUserChars)
@@ -1232,6 +1364,10 @@ namespace SeeSharp.Models
                         lmStudioResponsesClient: lmStudioResponsesClient,
                         repoContext: repoContext,
                         cancellation: cancellation).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {

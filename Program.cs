@@ -4,6 +4,7 @@ using OpenAI.Chat;
 using OpenAI.Conversations;
 using OpenAI.Models;
 using OpenAI.Responses;
+using SeeSharp.Dev;
 using SeeSharp.Models;
 using System.ClientModel;
 using System.Diagnostics;
@@ -16,6 +17,7 @@ using System.Text.Json;
 
 #region functional running of the program
 ThemedConsole.Initialize();
+// Default path is the interactive test harness. Watch relaunch runs only for --legacy (avoids host output interleaving with prompts when using `dotnet run` without the debugger).
 if (TryRelaunchUnderDotnetWatch(args))
 {
     return;
@@ -44,6 +46,12 @@ availableModelsSB.AppendLine("LM Studio — select a loaded model:");
 
 using var cts = new CancellationTokenSource();
 List<OpenAIModel> models = (await lmStudioModelsClient.GetModelsAsync(cts.Token)).Value.ToList();
+
+if (!LocalTestProjectMenu.IsLegacyAllModelsMode(args))
+{
+    await LocalTestProjectMenu.RunAsync(credential, clientOptions, models, contextualizerChatClient, cts.Token);
+    return;
+}
 
 //Dictionary<string,string> questions = new Dictionary<string, string>()
 //{
@@ -94,6 +102,11 @@ static bool TryRelaunchUnderDotnetWatch(string[] args)
         return false;
     }
 
+    if (!LocalTestProjectMenu.IsLegacyAllModelsMode(args))
+    {
+        return false;
+    }
+
     // Spawning `dotnet watch` exits this process and drops the Visual Studio debugger attachment.
     if (Debugger.IsAttached)
     {
@@ -132,7 +145,7 @@ static bool TryRelaunchUnderDotnetWatch(string[] args)
 
         Process.Start(psi);
         ThemedConsole.WriteLine(TerminalTone.Reasoning,
-            "[DevMode] Relaunched under `dotnet watch run` (set SEESHARP_DISABLE_WATCH=1 to bypass).");
+            "[DevMode] Relaunched under `dotnet watch run` for --legacy (set SEESHARP_DISABLE_WATCH=1 to bypass).");
         return true;
     }
     catch (Exception ex)

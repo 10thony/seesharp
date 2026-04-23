@@ -4,6 +4,11 @@
       "commandName": "Project",
       "console": "integratedTerminal"
     },
+    "SeeSharp (legacy all models)": {
+      "commandName": "Project",
+      "commandLineArgs": "--legacy",
+      "console": "integratedTerminal"
+    },
     "Container (Dockerfile)": {
       "commandName": "Docker"
     }

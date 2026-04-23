@@ -1,10 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
-using System.Diagnostics;
 using System.Text.RegularExpressions;
-using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace SeeSharp.Models
 {
@@ -219,45 +221,89 @@ namespace SeeSharp.Models
         {
             try
             {
-                string root = AgentUtilities.ResolveWorkspaceRoot();
-                string resolvedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
-                    ? root
-                    : AgentUtilities.ResolveAbsPath(workingDirectory);
-
-                if (!Directory.Exists(resolvedWorkingDirectory))
+                return Bash_ToolAsync(command, workingDirectory).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                return new Dictionary<string, object>
                 {
-                    return new Dictionary<string, object>
-                    {
-                        { "error", $"Working directory does not exist: {resolvedWorkingDirectory}" }
-                    };
-                }
+                    { "error", ex.Message }
+                };
+            }
+        }
 
-                if (!AgentUtilities.IsPathUnderWorkspaceRoot(resolvedWorkingDirectory, root))
+        private static async Task<Dictionary<string, object>> Bash_ToolAsync(string command, string? workingDirectory)
+        {
+            string root = AgentUtilities.ResolveWorkspaceRoot();
+            string resolvedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
+                ? root
+                : AgentUtilities.ResolveAbsPath(workingDirectory);
+
+            if (!Directory.Exists(resolvedWorkingDirectory))
+            {
+                return new Dictionary<string, object>
                 {
-                    return new Dictionary<string, object>
-                    {
-                        { "error", "Working directory must remain inside workspace root." }
-                    };
-                }
+                    { "error", $"Working directory does not exist: {resolvedWorkingDirectory}" }
+                };
+            }
 
-                ThemedConsole.WriteLine(TerminalTone.Tool, $"[Tool] BASH command: {command}");
+            if (!AgentUtilities.IsPathUnderWorkspaceRoot(resolvedWorkingDirectory, root))
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", "Working directory must remain inside workspace root." }
+                };
+            }
 
-                ProcessStartInfo startInfo = CreateShellStartInfo(command, resolvedWorkingDirectory);
+            TimeSpan wallTimeout = AgentDefaults.BashCommandTimeout;
+            ThemedConsole.WriteLine(
+                TerminalTone.Tool,
+                $"[Tool] BASH started (max {wallTimeout.TotalSeconds:F0}s): {command}");
 
-                using Process process = new Process { StartInfo = startInfo };
+            ProcessStartInfo startInfo = CreateShellStartInfo(command, resolvedWorkingDirectory);
+            using CancellationTokenSource telemetryCts = new();
+            DateTime startUtc = DateTime.UtcNow;
+            Task telemetryTask = Task.Run(
+                () => BashProgressTelemetryAsync(telemetryCts.Token, startUtc, wallTimeout),
+                CancellationToken.None);
+
+            try
+            {
+                using Process process = new() { StartInfo = startInfo };
                 process.Start();
-                string stdout = process.StandardOutput.ReadToEnd();
-                string stderr = process.StandardError.ReadToEnd();
-                bool exited = process.WaitForExit(30_000);
-                if (!exited)
+
+                // Read stdout and stderr concurrently to avoid classic redirected-pipe deadlocks.
+                Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+                Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+                Task waitTask = process.WaitForExitAsync();
+                Task allWork = Task.WhenAll(stdoutTask, stderrTask, waitTask);
+
+                Task delayTask = Task.Delay(wallTimeout);
+                Task finished = await Task.WhenAny(allWork, delayTask).ConfigureAwait(false);
+                if (finished != allWork)
                 {
                     try { process.Kill(entireProcessTree: true); } catch { }
+                    try
+                    {
+                        await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(TimeSpan.FromSeconds(3))
+                            .ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                    }
+
                     return new Dictionary<string, object>
                     {
-                        { "error", "BASH command timed out after 30s." },
+                        { "error", $"BASH command timed out after {wallTimeout.TotalSeconds:F0}s." },
                         { "working_directory", resolvedWorkingDirectory }
                     };
                 }
+
+                string stdout = await stdoutTask.ConfigureAwait(false);
+                string stderr = await stderrTask.ConfigureAwait(false);
+                ThemedConsole.WriteLine(
+                    TerminalTone.Tool,
+                    $"[Tool] BASH finished in {(DateTime.UtcNow - startUtc).TotalSeconds:F1}s (exit {process.ExitCode})");
 
                 return new Dictionary<string, object>
                 {
@@ -268,12 +314,45 @@ namespace SeeSharp.Models
                     { "stderr", stderr.Length > 30_000 ? stderr[..30_000] + "\n[...truncated...]" : stderr }
                 };
             }
-            catch (Exception ex)
+            finally
             {
-                return new Dictionary<string, object>
+                telemetryCts.Cancel();
+                try
                 {
-                    { "error", ex.Message }
-                };
+                    await telemetryTask.ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private static async Task BashProgressTelemetryAsync(
+            CancellationToken cancellationToken,
+            DateTime startUtc,
+            TimeSpan maxDuration)
+        {
+            TimeSpan interval = AgentDefaults.BashTelemetryInterval;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                double elapsed = (DateTime.UtcNow - startUtc).TotalSeconds;
+                if (elapsed >= maxDuration.TotalSeconds)
+                {
+                    return;
+                }
+
+                ThemedConsole.WriteLine(
+                    TerminalTone.Tool,
+                    $"[Tool] BASH still running… ({elapsed:F0}s / {maxDuration.TotalSeconds:F0}s max)");
             }
         }
 

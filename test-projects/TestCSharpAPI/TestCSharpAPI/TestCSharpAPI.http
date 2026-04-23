@@ -1,0 +1,6 @@
+@TestCSharpAPI_HostAddress = http://localhost:5263
+
+GET {{TestCSharpAPI_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
