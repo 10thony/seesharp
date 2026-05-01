@@ -90,5 +90,3 @@ Our method is straight forward, we make a Get request, parse the response and re
 There are two helper classes, one to represent the Response from the HTTPGet of the models, 
 the second a class to represent the AIModel available for use.
 @/getmodelshelpermethods.png
-
-
