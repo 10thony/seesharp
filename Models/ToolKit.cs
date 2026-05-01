@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -255,7 +256,43 @@ namespace SeeSharp.Models
                 };
             }
 
+            if (LooksLikeRawSqlCommand(command))
+            {
+                return new Dictionary<string, object>
+                {
+                    { "command", command },
+                    { "working_directory", resolvedWorkingDirectory },
+                    { "error", "Command looks like raw SQL, not a shell command. Write SQL to a .sql file first, then execute it with psql or docker compose exec." },
+                    { "hint", RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                        ? "PowerShell example: @'CREATE TABLE ...;'@ | Set-Content CreateTable.sql"
+                        : "POSIX example: printf 'CREATE TABLE ...;\\n' > create_table.sql" }
+                };
+            }
+
+            if (LooksLikeEscapedSqlWriteCommand(command))
+            {
+                return new Dictionary<string, object>
+                {
+                    { "command", command },
+                    { "working_directory", resolvedWorkingDirectory },
+                    { "error", "SQL write command appears to embed escaped newline/string-literal SQL. Write raw multiline SQL content instead." },
+                    { "hint", RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                        ? "Use PowerShell here-string: @'...SQL...'@ | Set-Content file.sql"
+                        : "Use heredoc: cat <<'EOF' > file.sql" }
+                };
+            }
+
+            string originalCommand = command;
+            string? composeAutoCorrection = null;
+            if (TryRewriteDockerComposeServiceCommand(command, resolvedWorkingDirectory, out string rewrittenCommand, out string correctionNote))
+            {
+                command = rewrittenCommand;
+                composeAutoCorrection = correctionNote;
+                ThemedConsole.WriteLine(TerminalTone.Tool, $"[Tool] BASH docker-compose autocorrect: {correctionNote}");
+            }
+
             TimeSpan wallTimeout = AgentDefaults.BashCommandTimeout;
+            CreateMissingWriteParentDirectories(command, resolvedWorkingDirectory, root);
             ThemedConsole.WriteLine(
                 TerminalTone.Tool,
                 $"[Tool] BASH started (max {wallTimeout.TotalSeconds:F0}s): {command}");
@@ -308,8 +345,17 @@ namespace SeeSharp.Models
                 return new Dictionary<string, object>
                 {
                     { "command", command },
+                    { "original_command", originalCommand },
                     { "working_directory", resolvedWorkingDirectory },
+                    { "shell", GetNativeShellDisplayName() },
+                    { "shell_family", RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "powershell" : "posix" },
+                    { "ok", process.ExitCode == 0 },
                     { "exit_code", process.ExitCode },
+                    { "summary", process.ExitCode == 0
+                        ? $"Command succeeded in {(DateTime.UtcNow - startUtc).TotalSeconds:F1}s."
+                        : $"Command failed with exit code {process.ExitCode}." },
+                    { "auto_correction", composeAutoCorrection ?? "" },
+                    { "sql_format_warnings", BuildSqlFormatWarnings(command, resolvedWorkingDirectory) },
                     { "stdout", stdout.Length > 30_000 ? stdout[..30_000] + "\n[...truncated...]" : stdout },
                     { "stderr", stderr.Length > 30_000 ? stderr[..30_000] + "\n[...truncated...]" : stderr }
                 };
@@ -325,6 +371,369 @@ namespace SeeSharp.Models
                 {
                 }
             }
+        }
+
+        private static bool LooksLikeRawSqlCommand(string command) =>
+            !string.IsNullOrWhiteSpace(command) &&
+            Regex.IsMatch(command.TrimStart(), @"^(CREATE|INSERT|UPDATE|DELETE|ALTER|DROP|TRUNCATE)\b", RegexOptions.IgnoreCase);
+
+        private static bool LooksLikeEscapedSqlWriteCommand(string command)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                return false;
+            }
+
+            bool writesFile = Regex.IsMatch(
+                command,
+                @"\b(Set-Content|Add-Content|Out-File)\b|>>?|tee\b",
+                RegexOptions.IgnoreCase);
+            if (!writesFile)
+            {
+                return false;
+            }
+
+            bool sqlLike = Regex.IsMatch(
+                command,
+                @"\b(CREATE\s+TABLE|INSERT\s+INTO|ALTER\s+TABLE|DROP\s+TABLE|REFERENCES)\b",
+                RegexOptions.IgnoreCase);
+            if (!sqlLike)
+            {
+                return false;
+            }
+
+            // Guard against literal \n SQL blobs in quoted strings.
+            return command.Contains("\\n", StringComparison.Ordinal);
+        }
+
+        private static string BuildSqlFormatWarnings(string command, string workingDirectory)
+        {
+            string? sqlPath = TryExtractSqlPathFromWriteCommand(command, workingDirectory);
+            if (string.IsNullOrWhiteSpace(sqlPath) || !File.Exists(sqlPath))
+            {
+                return "";
+            }
+
+            string content;
+            try
+            {
+                content = File.ReadAllText(sqlPath);
+            }
+            catch
+            {
+                return "";
+            }
+
+            List<string> warnings = new();
+            if (content.Contains("\\n", StringComparison.Ordinal))
+            {
+                warnings.Add("Contains literal '\\n' sequences; expected real line breaks.");
+            }
+
+            if (!content.EndsWith('\n'))
+            {
+                warnings.Add("Missing trailing newline at end of file.");
+            }
+
+            // Catch single-line SQL blobs that should be multiline.
+            if ((content.Contains("CREATE TABLE", StringComparison.OrdinalIgnoreCase) ||
+                 content.Contains("INSERT INTO", StringComparison.OrdinalIgnoreCase)) &&
+                !content.Contains('\n'))
+            {
+                warnings.Add("SQL appears in a single line; expected formatted multiline SQL.");
+            }
+
+            return string.Join(" ", warnings);
+        }
+
+        private static string? TryExtractSqlPathFromWriteCommand(string command, string workingDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                return null;
+            }
+
+            // PowerShell style: -Path "file.sql"
+            Match psPath = Regex.Match(
+                command,
+                @"-Path\s+(?<p>""[^""]+\.sql""|'[^']+\.sql'|[^\s;|&]+\.sql)",
+                RegexOptions.IgnoreCase);
+            if (psPath.Success)
+            {
+                return ResolveCommandPath(psPath.Groups["p"].Value, workingDirectory);
+            }
+
+            // Redirection style: > file.sql or >> file.sql
+            Match redirPath = Regex.Match(
+                command,
+                @">>?\s*(?<p>""[^""]+\.sql""|'[^']+\.sql'|[^\s;|&]+\.sql)",
+                RegexOptions.IgnoreCase);
+            if (redirPath.Success)
+            {
+                return ResolveCommandPath(redirPath.Groups["p"].Value, workingDirectory);
+            }
+
+            return null;
+        }
+
+        private static string ResolveCommandPath(string rawPath, string workingDirectory)
+        {
+            string cleaned = rawPath.Trim().Trim('"', '\'');
+            return Path.IsPathRooted(cleaned)
+                ? Path.GetFullPath(cleaned)
+                : Path.GetFullPath(Path.Combine(workingDirectory, cleaned));
+        }
+
+        private static bool TryRewriteDockerComposeServiceCommand(
+            string command,
+            string resolvedWorkingDirectory,
+            out string rewritten,
+            out string note)
+        {
+            rewritten = command;
+            note = "";
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                return false;
+            }
+
+            Match composeMatch = Regex.Match(
+                command,
+                @"^\s*docker\s+compose\s+(?<sub>[a-zA-Z]+)\b(?<rest>.*)$",
+                RegexOptions.IgnoreCase);
+            if (!composeMatch.Success)
+            {
+                return false;
+            }
+
+            string sub = composeMatch.Groups["sub"].Value.ToLowerInvariant();
+            if (!sub.Equals("up", StringComparison.Ordinal) &&
+                !sub.Equals("start", StringComparison.Ordinal) &&
+                !sub.Equals("stop", StringComparison.Ordinal) &&
+                !sub.Equals("restart", StringComparison.Ordinal) &&
+                !sub.Equals("exec", StringComparison.Ordinal) &&
+                !sub.Equals("logs", StringComparison.Ordinal) &&
+                !sub.Equals("ps", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (!TryBuildDockerComposeAliasMap(resolvedWorkingDirectory, out Dictionary<string, string> aliasToService))
+            {
+                return false;
+            }
+
+            string? token = TryExtractLikelyComposeServiceToken(command, sub);
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                return false;
+            }
+
+            string trimmedToken = token.Trim().Trim('"', '\'');
+            if (string.IsNullOrWhiteSpace(trimmedToken))
+            {
+                return false;
+            }
+
+            if (aliasToService.ContainsKey(trimmedToken))
+            {
+                return false;
+            }
+
+            string normalizedToken = NormalizeAlias(trimmedToken);
+            if (string.IsNullOrWhiteSpace(normalizedToken))
+            {
+                return false;
+            }
+
+            string? mappedService = null;
+            if (aliasToService.TryGetValue(normalizedToken, out string? exactMapped))
+            {
+                mappedService = exactMapped;
+            }
+            else
+            {
+                List<string> fuzzyMatches = aliasToService
+                    .Where(kvp =>
+                    {
+                        string keyNorm = NormalizeAlias(kvp.Key);
+                        return keyNorm.Contains(normalizedToken, StringComparison.OrdinalIgnoreCase) ||
+                               normalizedToken.Contains(keyNorm, StringComparison.OrdinalIgnoreCase);
+                    })
+                    .Select(kvp => kvp.Value)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (fuzzyMatches.Count == 1)
+                {
+                    mappedService = fuzzyMatches[0];
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(mappedService))
+            {
+                return false;
+            }
+
+            rewritten = Regex.Replace(
+                command,
+                $@"\b{Regex.Escape(trimmedToken)}\b",
+                mappedService,
+                RegexOptions.IgnoreCase,
+                TimeSpan.FromMilliseconds(200));
+            note = $"service '{trimmedToken}' -> '{mappedService}' from docker-compose aliases";
+            return !string.Equals(rewritten, command, StringComparison.Ordinal);
+        }
+
+        private static bool TryBuildDockerComposeAliasMap(
+            string resolvedWorkingDirectory,
+            out Dictionary<string, string> aliasToService)
+        {
+            aliasToService = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string yml = Path.Combine(resolvedWorkingDirectory, "docker-compose.yml");
+            string yaml = Path.Combine(resolvedWorkingDirectory, "docker-compose.yaml");
+            string composePath = File.Exists(yml) ? yml : (File.Exists(yaml) ? yaml : "");
+            if (string.IsNullOrWhiteSpace(composePath))
+            {
+                return false;
+            }
+
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(composePath);
+            }
+            catch
+            {
+                return false;
+            }
+
+            bool inServices = false;
+            string? currentService = null;
+            foreach (string raw in lines)
+            {
+                string line = raw.Replace("\t", "    ");
+                string trimmed = line.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("#", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                int indent = line.Length - line.TrimStart().Length;
+                if (!inServices)
+                {
+                    if (trimmed.Equals("services:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        inServices = true;
+                    }
+                    continue;
+                }
+
+                if (indent == 0 && !trimmed.Equals("services:", StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+
+                if (indent == 2 && trimmed.EndsWith(":", StringComparison.Ordinal))
+                {
+                    currentService = trimmed[..^1].Trim();
+                    if (!string.IsNullOrWhiteSpace(currentService))
+                    {
+                        AddComposeAlias(aliasToService, currentService, currentService);
+                    }
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(currentService) &&
+                    indent >= 4 &&
+                    trimmed.StartsWith("container_name:", StringComparison.OrdinalIgnoreCase))
+                {
+                    string containerName = trimmed["container_name:".Length..].Trim().Trim('"', '\'');
+                    if (!string.IsNullOrWhiteSpace(containerName))
+                    {
+                        AddComposeAlias(aliasToService, containerName, currentService);
+                    }
+                }
+            }
+
+            return aliasToService.Count > 0;
+        }
+
+        private static void AddComposeAlias(Dictionary<string, string> aliasToService, string alias, string service)
+        {
+            if (string.IsNullOrWhiteSpace(alias) || string.IsNullOrWhiteSpace(service))
+            {
+                return;
+            }
+
+            aliasToService[alias] = service;
+            string normalized = NormalizeAlias(alias);
+            if (!string.IsNullOrWhiteSpace(normalized))
+            {
+                aliasToService[normalized] = service;
+            }
+        }
+
+        private static string NormalizeAlias(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                return "";
+            }
+
+            StringBuilder sb = new StringBuilder(input.Length);
+            foreach (char c in input.ToLowerInvariant())
+            {
+                if (char.IsLetterOrDigit(c))
+                {
+                    sb.Append(c);
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static string? TryExtractLikelyComposeServiceToken(string command, string subCommand)
+        {
+            // Tokenize while preserving simple quoted groups.
+            MatchCollection tokenMatches = Regex.Matches(command, @"(""[^""]*""|'[^']*'|\S+)");
+            List<string> tokens = tokenMatches.Select(m => m.Value).ToList();
+            int composeIdx = tokens.FindIndex(t => t.Equals("compose", StringComparison.OrdinalIgnoreCase));
+            if (composeIdx < 0 || composeIdx + 1 >= tokens.Count)
+            {
+                return null;
+            }
+
+            int idx = composeIdx + 2; // first token after subcommand
+            while (idx < tokens.Count)
+            {
+                string t = tokens[idx];
+                if (t.StartsWith("-", StringComparison.Ordinal))
+                {
+                    // Skip flag value when likely present.
+                    if ((t.Equals("-f", StringComparison.OrdinalIgnoreCase) ||
+                         t.Equals("--file", StringComparison.OrdinalIgnoreCase) ||
+                         t.Equals("--project-name", StringComparison.OrdinalIgnoreCase) ||
+                         t.Equals("-p", StringComparison.OrdinalIgnoreCase)) &&
+                        idx + 1 < tokens.Count)
+                    {
+                        idx += 2;
+                        continue;
+                    }
+
+                    idx++;
+                    continue;
+                }
+
+                // For `docker compose ps` without args, no service token exists.
+                if (subCommand.Equals("ps", StringComparison.OrdinalIgnoreCase) &&
+                    t.Contains("=", StringComparison.Ordinal))
+                {
+                    return null;
+                }
+
+                return t.Trim('"', '\'');
+            }
+
+            return null;
         }
 
         private static async Task BashProgressTelemetryAsync(
@@ -398,6 +807,111 @@ namespace SeeSharp.Models
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+        }
+
+        private static string GetNativeShellDisplayName()
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                return ResolveFirstAvailableCommand("pwsh")
+                    ? "PowerShell 7 (pwsh)"
+                    : "Windows PowerShell";
+            }
+
+            if (File.Exists("/bin/bash") || ResolveFirstAvailableCommand("bash"))
+            {
+                return "bash";
+            }
+
+            if (File.Exists("/bin/zsh") || ResolveFirstAvailableCommand("zsh"))
+            {
+                return "zsh";
+            }
+
+            return "sh";
+        }
+
+        /// <summary>
+        /// Best-effort guard: create parent directories when command writes to a redirected file.
+        /// This avoids common failures like `> sql/file.sql` when `sql/` does not exist.
+        /// </summary>
+        private static void CreateMissingWriteParentDirectories(
+            string command,
+            string resolvedWorkingDirectory,
+            string workspaceRoot)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                return;
+            }
+
+            foreach (string target in ExtractRedirectTargetPaths(command))
+            {
+                if (string.IsNullOrWhiteSpace(target))
+                {
+                    continue;
+                }
+
+                string normalized = target.Trim().Trim('\'', '"');
+                if (string.IsNullOrWhiteSpace(normalized))
+                {
+                    continue;
+                }
+
+                // Ignore obvious stream redirects and dynamic expressions.
+                if (normalized.StartsWith("&", StringComparison.Ordinal) ||
+                    normalized.StartsWith("$", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                string fullPath = Path.IsPathRooted(normalized)
+                    ? Path.GetFullPath(normalized)
+                    : Path.GetFullPath(Path.Combine(resolvedWorkingDirectory, normalized));
+
+                string? parent = Path.GetDirectoryName(fullPath);
+                if (string.IsNullOrWhiteSpace(parent))
+                {
+                    continue;
+                }
+
+                if (!AgentUtilities.IsPathUnderWorkspaceRoot(parent, workspaceRoot))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    Directory.CreateDirectory(parent);
+                }
+                catch
+                {
+                    // Non-fatal; command execution will surface a concrete error if write fails.
+                }
+            }
+        }
+
+        private static IEnumerable<string> ExtractRedirectTargetPaths(string command)
+        {
+            // Matches:
+            //   > path
+            //   >> path
+            //   1> path
+            //   2>> path
+            // Stops at separators ; | & or line breaks.
+            MatchCollection matches = Regex.Matches(
+                command,
+                @"(?:^|[\s;])(?:\d)?>>?\s*(?<path>(?:""[^""]+""|'[^']+'|[^\s;|&]+))",
+                RegexOptions.Multiline);
+
+            foreach (Match match in matches)
+            {
+                string value = match.Groups["path"].Value;
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    yield return value;
+                }
+            }
         }
 
         private static bool ResolveFirstAvailableCommand(string command)
@@ -614,9 +1128,23 @@ namespace SeeSharp.Models
                         return WebCall_Tool(
                             RequireArg(args, "url"));
                     case var actualToolName when key == AgentDefaults.BASH_TOOL_NAME:
-                        return Bash_Tool(
+                        Dictionary<string, object> bashResult = Bash_Tool(
                             RequireArg(args, "command"),
                             OptionalArg(args, "workingDirectory", "cwd", "directory"));
+                        if (bashResult.TryGetValue("exit_code", out object? exitCodeObj) &&
+                            int.TryParse(exitCodeObj?.ToString(), out int exitCode) &&
+                            exitCode != 0 &&
+                            !bashResult.ContainsKey("error"))
+                        {
+                            string stderrText = bashResult.TryGetValue("stderr", out object? stderrObj)
+                                ? (stderrObj?.ToString() ?? "")
+                                : "";
+                            string firstErrLine = stderrText
+                                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                                .FirstOrDefault() ?? "No stderr output.";
+                            bashResult["error"] = $"BASH command failed (exit {exitCode}): {firstErrLine}";
+                        }
+                        return bashResult;
 
                     default:
                         return new Dictionary<string, object>

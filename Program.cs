@@ -12,12 +12,16 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 
-// Traffic goes only to LM Studio. The OpenAI .NET SDK is used because LM Studio exposes the same /v1 routes
-// and wire models (e.g. OpenAIModel, ResponseResult); type names come from the library, not from calling OpenAI.
+// Traffic goes only to LM Studio. The OpenAI .NET SDK is used because LM
+// Studio exposes the same /v1 routes
+// and wire models (e.g. OpenAIModel, ResponseResult); type names come from
+// the library, not from calling OpenAI.
 
 #region functional running of the program
 ThemedConsole.Initialize();
-// Default path is the interactive test harness. Watch relaunch runs only for --legacy (avoids host output interleaving with prompts when using `dotnet run` without the debugger).
+// Default path is the interactive test harness. Watch relaunch
+// runs only for --legacy (avoids host output interleaving with prompts when using
+// `dotnet run` without the debugger).
 if (TryRelaunchUnderDotnetWatch(args))
 {
     return;
@@ -36,45 +40,56 @@ var clientOptions = new OpenAIClientOptions
 var lmStudioModelsClient = new OpenAIModelClient(credential, clientOptions);
 var lmStudioResponsesClient = new ResponsesClient(credential, clientOptions);
 
-string contextualizerModelId = Environment.GetEnvironmentVariable("SEESHARP_CONTEXTUALIZER_MODEL")
+string contextualizerModelId = Environment.
+    GetEnvironmentVariable("SEESHARP_CONTEXTUALIZER_MODEL")
     ?? Agent.DefaultContextualizerModelId;
-var contextualizerChatClient = new ChatClient(contextualizerModelId, credential, clientOptions);
+var contextualizerChatClient = new ChatClient(
+    contextualizerModelId, credential, clientOptions);
 
 StringBuilder availableModelsSB = new StringBuilder();
 availableModelsSB.AppendLine("LM Studio — select a loaded model:");
 
 
 using var cts = new CancellationTokenSource();
-List<OpenAIModel> models = (await lmStudioModelsClient.GetModelsAsync(cts.Token)).Value.ToList();
+List<OpenAIModel> models = (await lmStudioModelsClient
+    .GetModelsAsync(cts.Token)).Value.ToList();
 
 if (!LocalTestProjectMenu.IsLegacyAllModelsMode(args))
 {
-    await LocalTestProjectMenu.RunAsync(credential, clientOptions, models, contextualizerChatClient, cts.Token);
+    await LocalTestProjectMenu.RunAsync(
+        credential, clientOptions, models, contextualizerChatClient, cts.Token);
     return;
 }
 
-//Dictionary<string,string> questions = new Dictionary<string, string>()
-//{
-//    {"ReadOne","Read the Program.cs file and tell me what it does." },
-//    {"EditOne","Edit the Agent.cs file so it is a regular class instead of an abstract class." },
-//    {"ListOne","List the files in the codebase, study what there is, " +
-//    "determine the most important files to read, and tell me what this app does." },
-//    {"UnclearOne","How can i build this program?" },
-//    {"UnclearTwo","Study this codebase and let me know what it does." },
-//};
 
 List<string> questions = new List<string>()
 {
     //"Read the Program.cs file and tell me what it does.",
     //"Edit the Agent.cs file so it is a regular class instead of an abstract class.",
-    "what does cobec inc do? here is there homepage: https://www.cobec.com/",
+    //"what does cobec inc do? here is there homepage: https://www.cobec.com/",
     //"List the files in the codebase, study what there is, determine the most important files to read," +
     //" and tell me what this app does.",
     //"How can i build this program?",
-    //"Study this codebase and let me know what it does." //"List the files in the codebase, study what there is, determine the most important files to read," +
+    //"Study this codebase and let me know what it does."
+    //"List the files in the codebase, study what there is, determine the most important files to read," +
     //" and tell me what this app does.",
     //"How can i build this program?",
     //"Study this codebase and let me know what it does."
+    "Turn on the postgres docker container named testpostgres",
+    "Create a SQL file to create a user table with columns for ID" +
+        " (auto generated and incrementing Primary Key), name, role_id," +
+        "labor_category_code, ",
+    "Create a SQL script that creates an item with columns for, ID " +
+        "(auto generated and incrementing primary key)" +
+        "name, description, cost, manufacturer, location, owner (user id foreign key)," +
+        " status (item status lookup value)",
+    "Create a SQL script that creates an item status lookup table with values for" +
+        " active, inactive, and archived",
+    "Create a SQL script that creates a role lookup table with values for admin, user",
+    "Create a SQL script that creates a labor category lookup table with values for " +
+        "full time, part time, contractor,",
+    "Create a SQL Script that loads our postgres container with entities for the tables it contains.",
+
 };
 
 LMStudioToolKit toolKit = new LMStudioToolKit();
@@ -97,7 +112,8 @@ foreach (OpenAIModel model in models)
 #region get models functions
 static bool TryRelaunchUnderDotnetWatch(string[] args)
 {
-    if (string.Equals(Environment.GetEnvironmentVariable("SEESHARP_DISABLE_WATCH"), "1", StringComparison.Ordinal))
+    if (string.Equals(Environment.
+        GetEnvironmentVariable("SEESHARP_DISABLE_WATCH"), "1", StringComparison.Ordinal))
     {
         return false;
     }
@@ -114,7 +130,8 @@ static bool TryRelaunchUnderDotnetWatch(string[] args)
     }
 
     if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("DOTNET_WATCH")) ||
-        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("DOTNET_WATCH_ITERATION")))
+        !string.IsNullOrWhiteSpace(Environment.
+            GetEnvironmentVariable("DOTNET_WATCH_ITERATION")))
     {
         return false;
     }
@@ -145,13 +162,16 @@ static bool TryRelaunchUnderDotnetWatch(string[] args)
 
         Process.Start(psi);
         ThemedConsole.WriteLine(TerminalTone.Reasoning,
-            "[DevMode] Relaunched under `dotnet watch run` for --legacy (set SEESHARP_DISABLE_WATCH=1 to bypass).");
+            "[DevMode] Relaunched under `dotnet watch run` for --legacy" +
+            " (set SEESHARP_DISABLE_WATCH=1 to bypass).");
         return true;
     }
     catch (Exception ex)
     {
-        ThemedConsole.WriteLine(TerminalTone.Error, $"[DevMode] Failed to relaunch under dotnet watch: {ex.Message}");
-        ThemedConsole.WriteLine(TerminalTone.Reasoning, "[DevMode] Continuing without watch mode.");
+        ThemedConsole.WriteLine(TerminalTone.Error, 
+            $"[DevMode] Failed to relaunch under dotnet watch: {ex.Message}");
+        ThemedConsole.WriteLine(TerminalTone.Reasoning, 
+            "[DevMode] Continuing without watch mode.");
         return false;
     }
 }

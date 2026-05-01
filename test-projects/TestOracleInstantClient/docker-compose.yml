@@ -1,0 +1,7 @@
+services:
+  oracle-instant-client:
+    image: container-registry.oracle.com/database/instantclient:latest
+    container_name: test-oracle-instant-client
+    stdin_open: true
+    tty: true
+    command: ["bash"]

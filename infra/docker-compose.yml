@@ -1,0 +1,40 @@
+name: seesharp-convex-selfhosted
+
+services:
+  backend:
+    image: ghcr.io/get-convex/convex-backend:latest
+    container_name: seesharp-convex-backend
+    restart: unless-stopped
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "33210:3210"
+      - "33211:3211"
+    volumes:
+      - seesharp_convex_data:/convex/data
+    environment:
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:33210
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:33211
+      DISABLE_METRICS_ENDPOINT: "true"
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3210/version"]
+      interval: 5s
+      start_period: 10s
+
+  dashboard:
+    image: ghcr.io/get-convex/convex-dashboard:latest
+    container_name: seesharp-convex-dashboard
+    restart: unless-stopped
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "36791:6791"
+    environment:
+      NEXT_PUBLIC_DEPLOYMENT_URL: http://127.0.0.1:33210
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  seesharp_convex_data:

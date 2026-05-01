@@ -9,6 +9,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace SeeSharp.Models
@@ -38,9 +39,11 @@ namespace SeeSharp.Models
         /// <summary>Hard cap on successful (non-skipped) tool executions per user task.</summary>
         private const int MaxSuccessfulToolExecutionsPerTask = 22;
         private const int MaxResponseRetries = 3;
+        private const int MaxCompletionValidationRetries = 2;
         private const int MaxSerializedToolOutputChars = 12_000;
         private const int MaxToolStringValueChars = 4_000;
         private const int MaxNoProgressTurns = 3;
+        private const int MaxContextResetAttemptsPerTask = 3;
 
         public OpenAIModel Model { get; set; }
         private ToolKit ToolKit { get; set;  }
@@ -141,12 +144,15 @@ namespace SeeSharp.Models
             string lastAssistantText = "";
             IReadOnlyList<ToolExecutionEnvelope> lastToolOutputs = Array.Empty<ToolExecutionEnvelope>();
             bool shouldRehydrateRepoContext = false;
-            bool hasContextResetAttempted = false;
+            bool lowContextMode = false;
+            int contextResetAttempts = 0;
             int noProgressTurns = 0;
             string lastProgressSignature = "";
             HashSet<string> seenToolSignatures = new(StringComparer.OrdinalIgnoreCase);
             int successfulToolExecutions = 0;
             int consecutiveAllSkippedTurns = 0;
+            int completionValidationRetriesUsed = 0;
+            List<ToolExecutionEnvelope> cumulativeToolOutputs = new();
 
             for (int turn = 0; turn < MaxAgentTurnsPerTask; turn++)
             {
@@ -164,6 +170,7 @@ namespace SeeSharp.Models
                             input: currentInput,
                             lmStudioResponsesClient: responsesClient,
                             repoContext: perTurnRepoContext,
+                            compactPrompt: lowContextMode,
                             cancellation: ct),
                         cancellationToken).ConfigureAwait(false);
                 }
@@ -177,13 +184,23 @@ namespace SeeSharp.Models
                     ThemedConsole.WriteLine(TerminalTone.Error, "[Agent] Main model request timed out.");
                     return "Stopped: the model did not respond within the per-request time limit.";
                 }
-                catch (Exception ex) when (IsContextWindowExceeded(ex) && !hasContextResetAttempted)
+                catch (Exception ex) when (IsContextWindowExceeded(ex))
                 {
-                    hasContextResetAttempted = true;
-                    shouldRehydrateRepoContext = true;
-                    currentInput = BuildResumeAfterContextResetInput(task, lastAssistantText, lastToolOutputs);
-                    ThemedConsole.WriteLine(TerminalTone.Error,
-                        "[Agent] Context window exceeded. Resetting context and resubmitting current task.");
+                    contextResetAttempts++;
+                    lowContextMode = true;
+                    if (contextResetAttempts > MaxContextResetAttemptsPerTask)
+                    {
+                        return "Stopped gracefully: context limit was exceeded repeatedly. " +
+                            "Run again with a larger model context window or fewer tasks per run.";
+                    }
+
+                    // "Fresh agent + in-memory context": do not re-attach full repo context after overflow.
+                    shouldRehydrateRepoContext = false;
+                    currentInput = BuildResumeAfterContextResetInput(task, lastAssistantText, cumulativeToolOutputs);
+                    ThemedConsole.WriteLine(
+                        TerminalTone.Error,
+                        $"[Agent] Context window exceeded. Resetting to compact in-memory state and retrying " +
+                        $"({contextResetAttempts}/{MaxContextResetAttemptsPerTask}).");
                     continue;
                 }
 
@@ -219,7 +236,38 @@ namespace SeeSharp.Models
 
                 if (invocations.Count == 0)
                 {
-                    return assistantText;
+                    TaskCompletionAssessment assessment = await AssessTaskCompletionAsync(
+                        responsesClient,
+                        task,
+                        assistantText,
+                        cumulativeToolOutputs,
+                        repoContext,
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (assessment.IsComplete)
+                    {
+                        return assistantText;
+                    }
+
+                    if (completionValidationRetriesUsed >= MaxCompletionValidationRetries)
+                    {
+                        return assistantText +
+                            "\n\n[Validation note] Task may be incomplete: " +
+                            (string.IsNullOrWhiteSpace(assessment.Gap)
+                                ? "No explicit completion evidence was found."
+                                : assessment.Gap);
+                    }
+
+                    completionValidationRetriesUsed++;
+                    shouldRehydrateRepoContext = true;
+                    currentInput = BuildCompletionRetryInput(
+                        task,
+                        assistantText,
+                        assessment,
+                        cumulativeToolOutputs,
+                        completionValidationRetriesUsed,
+                        MaxCompletionValidationRetries);
+                    continue;
                 }
 
                 invocations = invocations.Take(MaxToolCallsPerTurn).ToList();
@@ -251,6 +299,7 @@ namespace SeeSharp.Models
                     });
                 }
                 lastToolOutputs = toolOutputs;
+                cumulativeToolOutputs.AddRange(toolOutputs);
 
                 successfulToolExecutions += CountSuccessfulToolExecutions(toolOutputs);
                 if (successfulToolExecutions > MaxSuccessfulToolExecutionsPerTask)
@@ -568,6 +617,7 @@ namespace SeeSharp.Models
                     input: parserPrompt.ToString(),
                     lmStudioResponsesClient: responsesClient,
                     repoContext: repoContext,
+                    compactPrompt: false,
                     cancellation: ct),
                 cancellationToken).ConfigureAwait(false);
 
@@ -827,9 +877,9 @@ namespace SeeSharp.Models
             if (toolOutputs.Count > 0)
             {
                 string compactToolState = JsonSerializer.Serialize(toolOutputs);
-                if (compactToolState.Length > 8_000)
+                if (compactToolState.Length > 2_500)
                 {
-                    compactToolState = compactToolState[..8_000] + "\n[...truncated...]";
+                    compactToolState = compactToolState[..2_500] + "\n[...truncated for compact context mode...]";
                 }
 
                 sb.AppendLine("Most recent tool results:");
@@ -857,6 +907,341 @@ namespace SeeSharp.Models
             }
 
             return sb.ToString().TrimEnd();
+        }
+
+        private sealed class TaskCompletionAssessment
+        {
+            public bool IsComplete { get; set; }
+            public string Gap { get; set; } = "";
+            public string NextActionHint { get; set; } = "";
+        }
+
+        private sealed class EvidenceState
+        {
+            public bool AnyToolAttempted { get; set; }
+            public bool AnyToolSucceeded { get; set; }
+
+            public bool FileWriteAttempted { get; set; }
+            public bool FileWriteSucceeded { get; set; }
+            public bool FileReadSucceeded { get; set; }
+
+            public bool ServiceActionAttempted { get; set; }
+            public bool ServiceActionSucceeded { get; set; }
+            public bool ServiceStatusSucceeded { get; set; }
+
+            public bool NeedsVerification { get; set; }
+            public bool Verified { get; set; }
+            public string Gap { get; set; } = "";
+            public string NextActionHint { get; set; } = "";
+            public string Summary { get; set; } = "";
+        }
+
+        private async Task<TaskCompletionAssessment> AssessTaskCompletionAsync(
+            ResponsesClient responsesClient,
+            string task,
+            string assistantAnswer,
+            IReadOnlyList<ToolExecutionEnvelope> latestToolOutputs,
+            string repoContext,
+            CancellationToken cancellationToken)
+        {
+            EvidenceState evidence = AnalyzeEvidenceState(latestToolOutputs);
+            if (evidence.NeedsVerification && !evidence.Verified)
+            {
+                return new TaskCompletionAssessment
+                {
+                    IsComplete = false,
+                    Gap = evidence.Gap,
+                    NextActionHint = evidence.NextActionHint
+                };
+            }
+
+            string outputsJson = JsonSerializer.Serialize(latestToolOutputs);
+            if (outputsJson.Length > 8_000)
+            {
+                outputsJson = outputsJson[..8_000] + "\n[...truncated for validation safety...]";
+            }
+
+            StringBuilder validatorPrompt = new StringBuilder();
+            validatorPrompt.AppendLine("You are a strict task-completion validator.");
+            validatorPrompt.AppendLine("Decide whether the assistant actually completed the user's task intent.");
+            validatorPrompt.AppendLine("Use the task, assistant answer, and tool evidence.");
+            validatorPrompt.AppendLine("Return ONLY valid JSON with this exact schema:");
+            validatorPrompt.AppendLine("{\"isComplete\":true|false,\"gap\":\"...\",\"nextActionHint\":\"...\"}");
+            validatorPrompt.AppendLine("Rules:");
+            validatorPrompt.AppendLine("- Mark false if commands failed (non-zero exits) and success wasn't later proven.");
+            validatorPrompt.AppendLine("- Mark false if the answer claims completion without concrete evidence.");
+            validatorPrompt.AppendLine("- For file creation/edit tasks, require evidence that file exists or was read after write.");
+            validatorPrompt.AppendLine("- For service/container tasks, require evidence service is up/healthy.");
+            validatorPrompt.AppendLine("- Keep gap and nextActionHint short and actionable.");
+            validatorPrompt.AppendLine();
+            validatorPrompt.AppendLine("Task:");
+            validatorPrompt.AppendLine(task);
+            validatorPrompt.AppendLine();
+            validatorPrompt.AppendLine("Assistant answer:");
+            validatorPrompt.AppendLine(assistantAnswer);
+            validatorPrompt.AppendLine();
+            validatorPrompt.AppendLine("Deterministic evidence summary:");
+            validatorPrompt.AppendLine(evidence.Summary);
+            validatorPrompt.AppendLine();
+            validatorPrompt.AppendLine("Latest tool outputs JSON:");
+            validatorPrompt.AppendLine(outputsJson);
+
+            try
+            {
+                CreateResponseResult parsed = await WithPerCallTimeoutAndTelemetryAsync(
+                    "[Agent] completion validator",
+                    TerminalTone.Reasoning,
+                    AgentDefaults.ResponsesApiCallTimeout,
+                    ct => CreateResponseWithRetryAsync(
+                        modelId: DefaultToolInvocationHandlerModel,
+                        input: validatorPrompt.ToString(),
+                        lmStudioResponsesClient: responsesClient,
+                        repoContext: repoContext,
+                        compactPrompt: false,
+                        cancellation: ct),
+                    cancellationToken).ConfigureAwait(false);
+
+                string json = parsed.ResponseContentText?.Trim() ?? "";
+                if (json.StartsWith("```", StringComparison.Ordinal))
+                {
+                    int firstNl = json.IndexOf('\n');
+                    if (firstNl >= 0)
+                    {
+                        json = json[(firstNl + 1)..];
+                    }
+
+                    int fence = json.LastIndexOf("```", StringComparison.Ordinal);
+                    if (fence >= 0)
+                    {
+                        json = json[..fence];
+                    }
+
+                    json = json.Trim();
+                }
+
+                using JsonDocument doc = JsonDocument.Parse(json);
+                JsonElement root = doc.RootElement;
+
+                bool isComplete = root.TryGetProperty("isComplete", out JsonElement completeEl) &&
+                    completeEl.ValueKind == JsonValueKind.True;
+                string gap = root.TryGetProperty("gap", out JsonElement gapEl)
+                    ? (gapEl.ToString() ?? "")
+                    : "";
+                string next = root.TryGetProperty("nextActionHint", out JsonElement nextEl)
+                    ? (nextEl.ToString() ?? "")
+                    : "";
+
+                return new TaskCompletionAssessment
+                {
+                    IsComplete = isComplete,
+                    Gap = gap.Trim(),
+                    NextActionHint = next.Trim()
+                };
+            }
+            catch
+            {
+                return new TaskCompletionAssessment
+                {
+                    IsComplete = !evidence.NeedsVerification || evidence.Verified,
+                    Gap = string.IsNullOrWhiteSpace(evidence.Gap)
+                        ? "Validator response was malformed and completion could not be confirmed."
+                        : evidence.Gap,
+                    NextActionHint = string.IsNullOrWhiteSpace(evidence.NextActionHint)
+                        ? "Run one concrete verification command and report result."
+                        : evidence.NextActionHint
+                };
+            }
+        }
+
+        private static EvidenceState AnalyzeEvidenceState(IReadOnlyList<ToolExecutionEnvelope> outputs)
+        {
+            EvidenceState state = new();
+            foreach (ToolExecutionEnvelope output in outputs)
+            {
+                if (IsSkippedToolResult(output.Result))
+                {
+                    continue;
+                }
+
+                state.AnyToolAttempted = true;
+                bool success = IsSuccessfulToolResult(output.Result);
+                if (success)
+                {
+                    state.AnyToolSucceeded = true;
+                }
+
+                string command = TryGetToolCommand(output);
+                if (string.IsNullOrWhiteSpace(command))
+                {
+                    continue;
+                }
+
+                if (LooksLikeFileWriteCommand(command))
+                {
+                    state.FileWriteAttempted = true;
+                    if (success)
+                    {
+                        state.FileWriteSucceeded = true;
+                    }
+                }
+
+                if (LooksLikeFileReadCommand(command) && success)
+                {
+                    state.FileReadSucceeded = true;
+                }
+
+                if (LooksLikeServiceActionCommand(command))
+                {
+                    state.ServiceActionAttempted = true;
+                    if (success)
+                    {
+                        state.ServiceActionSucceeded = true;
+                    }
+                }
+
+                if (LooksLikeServiceStatusCommand(command) && success)
+                {
+                    state.ServiceStatusSucceeded = true;
+                }
+            }
+
+            if (state.ServiceActionAttempted)
+            {
+                state.NeedsVerification = true;
+                state.Verified = state.ServiceActionSucceeded && state.ServiceStatusSucceeded;
+                if (!state.Verified)
+                {
+                    state.Gap = "Service action was attempted but running/healthy status was not verified.";
+                    state.NextActionHint = "Run one status/health command for the same service and report successful output.";
+                }
+            }
+            else if (state.FileWriteAttempted)
+            {
+                state.NeedsVerification = true;
+                state.Verified = state.FileWriteSucceeded && state.FileReadSucceeded;
+                if (!state.Verified)
+                {
+                    state.Gap = "File write was attempted but existence/content verification evidence is missing.";
+                    state.NextActionHint = "Read back the written file path and confirm expected content.";
+                }
+            }
+            else
+            {
+                // Generic command tasks still need at least one successful run if tools were used.
+                state.NeedsVerification = state.AnyToolAttempted;
+                state.Verified = !state.AnyToolAttempted || state.AnyToolSucceeded;
+                if (state.AnyToolAttempted && !state.AnyToolSucceeded)
+                {
+                    state.Gap = "Tools were executed but none completed successfully.";
+                    state.NextActionHint = "Fix the failing command and rerun one successful verification command.";
+                }
+            }
+
+            state.Summary = BuildEvidenceSummary(state);
+            return state;
+        }
+
+        private static string BuildEvidenceSummary(EvidenceState state)
+        {
+            return $"anyAttempted={state.AnyToolAttempted}; anySucceeded={state.AnyToolSucceeded}; " +
+                $"fileWriteAttempted={state.FileWriteAttempted}; fileWriteSucceeded={state.FileWriteSucceeded}; fileReadSucceeded={state.FileReadSucceeded}; " +
+                $"serviceActionAttempted={state.ServiceActionAttempted}; serviceActionSucceeded={state.ServiceActionSucceeded}; serviceStatusSucceeded={state.ServiceStatusSucceeded}; " +
+                $"needsVerification={state.NeedsVerification}; verified={state.Verified}; " +
+                $"gap='{state.Gap}'; next='{state.NextActionHint}'";
+        }
+
+        private static bool IsSuccessfulToolResult(Dictionary<string, object> result)
+        {
+            if (result.TryGetValue("ok", out object? okObj) &&
+                bool.TryParse(okObj?.ToString(), out bool okParsed))
+            {
+                return okParsed;
+            }
+
+            if (result.TryGetValue("exit_code", out object? exitObj) &&
+                int.TryParse(exitObj?.ToString(), out int exitCode))
+            {
+                return exitCode == 0;
+            }
+
+            return !result.ContainsKey("error");
+        }
+
+        private static string TryGetToolCommand(ToolExecutionEnvelope output)
+        {
+            if (output.Result.TryGetValue("command", out object? cmdObj) &&
+                !string.IsNullOrWhiteSpace(cmdObj?.ToString()))
+            {
+                return cmdObj!.ToString()!;
+            }
+
+            if (output.Args.TryGetValue("command", out object? argCmdObj))
+            {
+                if (argCmdObj is JsonElement je)
+                {
+                    return je.ValueKind == JsonValueKind.String ? (je.GetString() ?? "") : je.ToString();
+                }
+                return argCmdObj?.ToString() ?? "";
+            }
+
+            return "";
+        }
+
+        private static bool LooksLikeServiceActionCommand(string command) =>
+            Regex.IsMatch(command, @"\b(docker\s+compose|docker\s+container|docker\s+service|kubectl|systemctl|service)\b", RegexOptions.IgnoreCase) &&
+            Regex.IsMatch(command, @"\b(up|start|stop|restart|down|exec)\b", RegexOptions.IgnoreCase);
+
+        private static bool LooksLikeServiceStatusCommand(string command) =>
+            Regex.IsMatch(command, @"\bpg_isready\b", RegexOptions.IgnoreCase) ||
+            (Regex.IsMatch(command, @"\b(docker\s+compose|docker\s+container|docker\s+service|kubectl|systemctl|service)\b", RegexOptions.IgnoreCase) &&
+             Regex.IsMatch(command, @"\b(ps|status|logs|inspect|get|describe|health|ready)\b", RegexOptions.IgnoreCase));
+
+        private static bool LooksLikeFileWriteCommand(string command) =>
+            Regex.IsMatch(command, @"(>\s*\S+|>>\s*\S+|\b(Set-Content|Add-Content|Out-File|New-Item\s+-ItemType\s+File|tee|touch|cp|mv)\b)", RegexOptions.IgnoreCase);
+
+        private static bool LooksLikeFileReadCommand(string command) =>
+            Regex.IsMatch(command, @"\b(Get-Content|cat|type|less|more|head|tail|ls|dir|Get-ChildItem|Test-Path|stat)\b", RegexOptions.IgnoreCase);
+
+        private static string BuildCompletionRetryInput(
+            string originalTask,
+            string lastAssistantText,
+            TaskCompletionAssessment assessment,
+            IReadOnlyList<ToolExecutionEnvelope> toolOutputs,
+            int retryNumber,
+            int maxRetries)
+        {
+            string outputsJson = JsonSerializer.Serialize(toolOutputs);
+            if (outputsJson.Length > 8_000)
+            {
+                outputsJson = outputsJson[..8_000] + "\n[...truncated for context window safety...]";
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("Your prior answer was judged likely incomplete for the current task intent.");
+            sb.AppendLine($"Validation retry {retryNumber}/{maxRetries}.");
+            if (!string.IsNullOrWhiteSpace(assessment.Gap))
+            {
+                sb.AppendLine("Gap to fix: " + assessment.Gap);
+            }
+
+            if (!string.IsNullOrWhiteSpace(assessment.NextActionHint))
+            {
+                sb.AppendLine("Suggested next action: " + assessment.NextActionHint);
+            }
+
+            sb.AppendLine("Do not restate assumptions. Verify completion with concrete evidence.");
+            sb.AppendLine("If tools are needed, emit one precise tool: line.");
+            sb.AppendLine("If complete, provide a short final answer that cites the evidence.");
+            sb.AppendLine();
+            sb.AppendLine("Original task:");
+            sb.AppendLine(originalTask);
+            sb.AppendLine();
+            sb.AppendLine("Previous assistant answer:");
+            sb.AppendLine(lastAssistantText);
+            sb.AppendLine();
+            sb.AppendLine("Most recent tool outputs JSON:");
+            sb.AppendLine(outputsJson);
+            return sb.ToString();
         }
 
         private static bool IsContextWindowExceeded(Exception ex)
@@ -957,12 +1342,12 @@ namespace SeeSharp.Models
             string pickRelevantFilesUserMessage = 
                 "You choose which source files matter for understanding this repository." +
                 " Reply with a single JSON object only, no markdown, no explanation. " +
-                " Schema: {\"paths\":[\"relative/path.cs\",...]} with at most 15 paths." +
+                " Schema: {\"paths\":[\"relative/path.ext\",...]} with at most 15 paths." +
                 " CRITICAL: Every string in \"paths\" MUST be copied EXACTLY from the file list below " +
                 "(including folder names). Do not reference README.md, LICENSE, or other common names" +
                 " unless that exact line appears in the list — many projects omit them, and" +
                 " some folders (e.g. third-party) are not listed." +
-                " Prefer: entries near the top of the list (entry points, *.csproj, Program.cs, core Models/)," +
+                " Prefer: entries near the top of the list (workspace manifests, app entry points, config, and core source files)," +
                 " and paths most relevant to the user's task. " +
                 "Favor a smaller, high-signal set (e.g. project file, program entry, core abstractions) over" +
                 " long lists of similar files. Use forward slashes as in the list.";
@@ -1301,7 +1686,22 @@ namespace SeeSharp.Models
                 "Prefer a single tool: line; at most two tool lines per reply.");
             sb.AppendLine("Format: tool: TOOL_NAME({\"argName\":\"value\"}) with valid JSON inside the parentheses.");
             sb.AppendLine("When BASH command text contains quotes, escape inner double-quotes as \\\" or use single quotes in the shell command.");
-            sb.AppendLine("Example bash read: tool: BASH({\"command\":\"Get-Content Program.cs\"})");
+            sb.AppendLine("BASH SHELL AWARENESS:");
+            sb.AppendLine("- On Windows, BASH runs in PowerShell (`pwsh`/`powershell`). Use native PowerShell commands (Get-ChildItem, Get-Content, Select-String, New-Item, Set-Content).");
+            sb.AppendLine("- On macOS/Linux, BASH runs in a POSIX shell (`bash`/`zsh`/`sh`). Use native shell commands (ls, cat, grep/rg, mkdir -p, printf, tee).");
+            sb.AppendLine("- Do not use bash heredocs (`cat <<EOF`) on Windows. Use PowerShell here-strings (`@'...'@`) piped to Set-Content.");
+            sb.AppendLine("- Before writing a file under a subdirectory, create the parent folder first (PowerShell: New-Item -ItemType Directory -Force; POSIX: mkdir -p).");
+            sb.AppendLine("- After creating or editing a file, immediately verify it with one read command and include the resolved file path in your next normal-language reply.");
+            sb.AppendLine("- Never send raw SQL text as a shell command. For SQL tasks, first create/update a `.sql` file, then optionally run it with `psql` or `docker compose exec`.");
+            sb.AppendLine("- For SQL file tasks, write files in the current workspace (no `/tmp`), unless the user explicitly asks for a temp path.");
+            sb.AppendLine("- SQL files must contain RAW SQL text with real line breaks, not escaped `\\n` literals inside a quoted string.");
+            sb.AppendLine("- Prefer single-write multi-line file creation.");
+            sb.AppendLine("  - Windows PowerShell: use a here-string piped to `Set-Content`.");
+            sb.AppendLine("  - macOS/Linux: use heredoc (`cat <<'EOF' > file.sql`) or `printf` with actual newlines.");
+            sb.AppendLine("- For Docker Compose, use service names from docker-compose.yml (not container_name) with commands like `docker compose up -d <service>`.");
+            sb.AppendLine("- If any compose command reports unknown service, immediately run `docker compose config --services`, then retry with one exact service name from that list.");
+            sb.AppendLine("Example Windows read: tool: BASH({\"command\":\"Get-Content Program.cs\"})");
+            sb.AppendLine("Example POSIX read: tool: BASH({\"command\":\"cat Program.cs\"})");
             sb.AppendLine("Example web call: tool: WEB_CALL({\"url\":\"https://www.cobec.com/\"})");
             sb.AppendLine();
             sb.AppendLine("When tool results are provided, consume them and continue until the task is complete.");
@@ -1315,6 +1715,7 @@ namespace SeeSharp.Models
         string input,
         ResponsesClient lmStudioResponsesClient,
         string? repoContext = null,
+        bool compactPrompt = false,
         CancellationToken cancellation = default)
             {
                 if (string.IsNullOrWhiteSpace(modelId))
@@ -1329,7 +1730,8 @@ namespace SeeSharp.Models
 
                 CreateResponseOptions options = new CreateResponseOptions { Model = modelId };
                 // Keep each model call in a fresh context window.
-                options.InputItems.Add(ResponseItem.CreateDeveloperMessageItem(GenerateSystemPrompt()));
+                options.InputItems.Add(ResponseItem.CreateDeveloperMessageItem(
+                    compactPrompt ? GenerateCompactSystemPrompt() : GenerateSystemPrompt()));
                 if (!string.IsNullOrWhiteSpace(repoContext))
                     options.InputItems.Add(ResponseItem.CreateDeveloperMessageItem(
                         "Repository context (prepared offline):\n" + repoContext));
@@ -1351,23 +1753,50 @@ namespace SeeSharp.Models
             string input,
             ResponsesClient lmStudioResponsesClient,
             string? repoContext,
+            bool compactPrompt,
             CancellationToken cancellation)
         {
             Exception? last = null;
+            string currentInput = input;
+            string? currentRepoContext = repoContext;
+            bool useCompactPrompt = compactPrompt;
             for (int attempt = 1; attempt <= MaxResponseRetries; attempt++)
             {
                 try
                 {
                     return await StartNewResponseAsync(
                         modelId: modelId,
-                        input: input,
+                        input: currentInput,
                         lmStudioResponsesClient: lmStudioResponsesClient,
-                        repoContext: repoContext,
+                        repoContext: currentRepoContext,
+                        compactPrompt: useCompactPrompt,
                         cancellation: cancellation).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
                     throw;
+                }
+                catch (Exception ex) when (IsContextWindowExceeded(ex))
+                {
+                    last = ex;
+                    // Progressive context shedding: compact prompt, shorter user message, then drop repo context.
+                    useCompactPrompt = true;
+                    if (currentInput.Length > 2800)
+                    {
+                        currentInput = AgentUtilities.TruncateMiddleForModel(currentInput, 2800) +
+                            "\n\n[...truncated due to model context limit...]\n";
+                    }
+                    else if (!string.IsNullOrWhiteSpace(currentRepoContext))
+                    {
+                        currentRepoContext = null;
+                    }
+
+                    if (attempt == MaxResponseRetries)
+                    {
+                        break;
+                    }
+
+                    continue;
                 }
                 catch (Exception ex)
                 {
@@ -1383,6 +1812,22 @@ namespace SeeSharp.Models
             }
 
             throw new InvalidOperationException($"Response failed after {MaxResponseRetries} attempts.", last);
+        }
+
+        private string GenerateCompactSystemPrompt()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("You are a coding assistant. Use tools reliably and keep outputs concise.");
+            sb.AppendLine("Available tools:");
+            sb.AppendLine(ToolKit.GenerateToolRegistryAsString());
+            sb.AppendLine("Rules:");
+            sb.AppendLine("- Prefer BASH; emit at most one tool line unless truly necessary.");
+            sb.AppendLine("- Use valid shell syntax for current OS.");
+            sb.AppendLine("- For SQL tasks, write raw multiline SQL into .sql files (no escaped \\n literals).");
+            sb.AppendLine("- After writing a file, verify by reading it back.");
+            sb.AppendLine("- For docker compose, use service names from docker-compose.yml.");
+            sb.AppendLine("Tool line format: tool: TOOL_NAME({\"arg\":\"value\"})");
+            return sb.ToString();
         }
 
         private sealed class ToolExecutionEnvelope

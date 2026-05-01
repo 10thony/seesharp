@@ -53,6 +53,34 @@ namespace SeeSharp.Models
             "Models/AgentUtilities.cs",
         };
 
+        static readonly string[] s_contextualizerPreferredFileNames =
+        {
+            // Language/runtime manifests and workspace markers.
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "dockerfile",
+            "package.json",
+            "pyproject.toml",
+            "requirements.txt",
+            "go.mod",
+            "pom.xml",
+            "*.csproj",
+            "*.sln",
+            "*.slnx",
+            // Common app entrypoints.
+            "program.cs",
+            "main.py",
+            "main.go",
+            "main.rs",
+            "app.py",
+            "app.ts",
+            "app.js",
+            "index.ts",
+            "index.js",
+            // Helpful project context for non-code roots.
+            "readme.md"
+        };
+
         public static string GetChatCompletionText(ChatCompletion completion)
         {
             var sb = new StringBuilder();
@@ -288,10 +316,12 @@ namespace SeeSharp.Models
         public static List<string> GetContextualizerFallbackPicks(IReadOnlyList<string> catalog)
         {
             var set = new HashSet<string>(catalog, StringComparer.OrdinalIgnoreCase);
-            var list = new List<string>();
+            var list = new List<string>(ContextualizerMaxFilesToRead);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (string p in s_contextualizerPinnedRelativePaths)
             {
-                if (set.Contains(p))
+                if (set.Contains(p) && seen.Add(p))
                 {
                     list.Add(p);
                     if (list.Count >= ContextualizerMaxFilesToRead)
@@ -299,7 +329,58 @@ namespace SeeSharp.Models
                 }
             }
 
+            if (list.Count < ContextualizerMaxFilesToRead)
+            {
+                foreach (string candidate in catalog)
+                {
+                    if (list.Count >= ContextualizerMaxFilesToRead)
+                        break;
+
+                    string fileName = Path.GetFileName(candidate);
+                    if (!IsPreferredContextualizerName(fileName))
+                        continue;
+
+                    if (seen.Add(candidate))
+                        list.Add(candidate);
+                }
+            }
+
+            // Last-resort safety net for stacks with no known marker names.
+            if (list.Count == 0)
+            {
+                foreach (string candidate in catalog)
+                {
+                    if (seen.Add(candidate))
+                    {
+                        list.Add(candidate);
+                        if (list.Count >= ContextualizerMaxFilesToRead)
+                            break;
+                    }
+                }
+            }
+
             return list;
+        }
+
+        static bool IsPreferredContextualizerName(string fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName))
+                return false;
+
+            foreach (string preferred in s_contextualizerPreferredFileNames)
+            {
+                if (preferred.StartsWith("*.", StringComparison.Ordinal))
+                {
+                    if (fileName.EndsWith(preferred[1..], StringComparison.OrdinalIgnoreCase))
+                        return true;
+                    continue;
+                }
+
+                if (string.Equals(fileName, preferred, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
         }
 
         static bool ShouldSkipWorkspaceRelativePath(string relativePath)

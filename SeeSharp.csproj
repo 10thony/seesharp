@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
     <DockerfileContext>.</DockerfileContext>
-    <DefaultItemExcludes>$(DefaultItemExcludes);test-projects\**\*.cs</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);test-projects\**;infra\**;tools\**</DefaultItemExcludes>
     <!-- Responses API is marked experimental in the OpenAI .NET package (OPENAI001). -->
     <NoWarn>$(NoWarn);OPENAI001</NoWarn>
   </PropertyGroup>
