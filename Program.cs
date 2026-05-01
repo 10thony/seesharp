@@ -51,13 +51,14 @@ availableModelsSB.AppendLine("LM Studio — select a loaded model:");
 
 
 using var cts = new CancellationTokenSource();
+await using ConvexService convexService = await ConvexService.CreateFromLocalEnvAsync(cts.Token);
 List<OpenAIModel> models = (await lmStudioModelsClient
     .GetModelsAsync(cts.Token)).Value.ToList();
 
 if (!LocalTestProjectMenu.IsLegacyAllModelsMode(args))
 {
     await LocalTestProjectMenu.RunAsync(
-        credential, clientOptions, models, contextualizerChatClient, cts.Token);
+        credential, clientOptions, models, contextualizerChatClient, convexService, cts.Token);
     return;
 }
 
@@ -96,7 +97,7 @@ LMStudioToolKit toolKit = new LMStudioToolKit();
 
 foreach (OpenAIModel model in models)
 {
-    LMStudioAgent agent = new(model, toolKit, contextualizerChatClient);
+    LMStudioAgent agent = new(model, toolKit, contextualizerChatClient, convexService);
 
 
     StringBuilder agentLoopStrings = await

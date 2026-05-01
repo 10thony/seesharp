@@ -51,6 +51,7 @@ public static class LocalTestProjectMenu
         OpenAIClientOptions clientOptions,
         IReadOnlyList<OpenAIModel> models,
         ChatClient contextualizerChatClient,
+        ConvexService convexService,
         CancellationToken cancellationToken)
     {
         if (models.Count == 0)
@@ -96,7 +97,7 @@ public static class LocalTestProjectMenu
             "[TestHarness] Using first loaded model (single-model run in test mode).");
 
         var toolKit = new LMStudioToolKit();
-        var agent = new LMStudioAgent(firstModel, toolKit, contextualizerChatClient);
+        var agent = new LMStudioAgent(firstModel, toolKit, contextualizerChatClient, convexService);
         var taskListForLoop = new List<string>(taskList);
         _ = await agent.AgentLoop(
             new ResponsesClient(credential, clientOptions),

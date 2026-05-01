@@ -1,6 +1,7 @@
 ﻿using OpenAI.Chat;
 using OpenAI.Models;
 using OpenAI.Responses;
+using SeeSharp.Models.Persistence;
 using System;
 using System.ClientModel;
 using System.ClientModel.Primitives;
@@ -15,8 +16,12 @@ using System.Threading;
 namespace SeeSharp.Models
 {
 
-    public class LMStudioAgent(OpenAIModel model, ToolKit toolRegistry, ChatClient contextualizerChatClient)
-        : Agent(model, toolRegistry, contextualizerChatClient)
+    public class LMStudioAgent(
+        OpenAIModel model,
+        ToolKit toolRegistry,
+        ChatClient contextualizerChatClient,
+        ConvexService? convexService = null)
+        : Agent(model, toolRegistry, contextualizerChatClient, convexService)
     {
     }
 
@@ -48,14 +53,17 @@ namespace SeeSharp.Models
         public OpenAIModel Model { get; set; }
         private ToolKit ToolKit { get; set;  }
         private readonly ChatClient? _contextualizerChatClient;
+        private readonly ConvexService? _convexService;
         
         public Agent(OpenAIModel model,
                      ToolKit toolRegistry,
-                     ChatClient? contextualizerChatClient = null)
+                     ChatClient? contextualizerChatClient = null,
+                     ConvexService? convexService = null)
         {
             this.Model = model;
             this.ToolKit = toolRegistry;
             _contextualizerChatClient = contextualizerChatClient;
+            _convexService = convexService;
         }
 
         public async Task<StringBuilder> AgentLoop(
@@ -140,9 +148,25 @@ namespace SeeSharp.Models
             string repoContext,
             CancellationToken cancellationToken)
         {
+            string taskRunId = Guid.NewGuid().ToString("N");
+            long startedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            await TryPersistTaskRunStartAsync(taskRunId, task, repoContext, startedAt, cancellationToken)
+                .ConfigureAwait(false);
+
+            async Task<string> CompleteAndReturnAsync(string finalText, string status)
+            {
+                await TryPersistTaskRunCompletionAsync(
+                        taskRunId,
+                        status,
+                        finalText,
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                return finalText;
+            }
+
             string currentInput = task;
             string lastAssistantText = "";
-            IReadOnlyList<ToolExecutionEnvelope> lastToolOutputs = Array.Empty<ToolExecutionEnvelope>();
             bool shouldRehydrateRepoContext = false;
             bool lowContextMode = false;
             int contextResetAttempts = 0;
@@ -182,7 +206,9 @@ namespace SeeSharp.Models
                     }
 
                     ThemedConsole.WriteLine(TerminalTone.Error, "[Agent] Main model request timed out.");
-                    return "Stopped: the model did not respond within the per-request time limit.";
+                    return await CompleteAndReturnAsync(
+                        "Stopped: the model did not respond within the per-request time limit.",
+                        "timed_out").ConfigureAwait(false);
                 }
                 catch (Exception ex) when (IsContextWindowExceeded(ex))
                 {
@@ -190,8 +216,10 @@ namespace SeeSharp.Models
                     lowContextMode = true;
                     if (contextResetAttempts > MaxContextResetAttemptsPerTask)
                     {
-                        return "Stopped gracefully: context limit was exceeded repeatedly. " +
-                            "Run again with a larger model context window or fewer tasks per run.";
+                        return await CompleteAndReturnAsync(
+                            "Stopped gracefully: context limit was exceeded repeatedly. " +
+                            "Run again with a larger model context window or fewer tasks per run.",
+                            "context_limit").ConfigureAwait(false);
                     }
 
                     // "Fresh agent + in-memory context": do not re-attach full repo context after overflow.
@@ -207,7 +235,8 @@ namespace SeeSharp.Models
                 string assistantText = assistantResponse.ResponseContentText?.Trim() ?? "";
                 if (string.IsNullOrWhiteSpace(assistantText))
                 {
-                    return "[Assistant returned empty output.]";
+                    return await CompleteAndReturnAsync("[Assistant returned empty output.]", "empty")
+                        .ConfigureAwait(false);
                 }
                 lastAssistantText = assistantText;
 
@@ -231,11 +260,24 @@ namespace SeeSharp.Models
                     ThemedConsole.WriteLine(
                         TerminalTone.Error,
                         "[Agent] Tool-call parser model request timed out.");
-                    return "Stopped: the tool parser did not respond within the per-request time limit.";
+                    return await CompleteAndReturnAsync(
+                        "Stopped: the tool parser did not respond within the per-request time limit.",
+                        "timed_out").ConfigureAwait(false);
                 }
 
                 if (invocations.Count == 0)
                 {
+                    await TryPersistAgentLoopTurnAsync(
+                            taskRunId,
+                            turn + 1,
+                            assistantText,
+                            Array.Empty<(string toolName, Dictionary<string, object?> args)>(),
+                            Array.Empty<ToolExecutionEnvelope>(),
+                            successfulToolExecutions,
+                            contextResetAttempts,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+
                     TaskCompletionAssessment assessment = await AssessTaskCompletionAsync(
                         responsesClient,
                         task,
@@ -246,16 +288,19 @@ namespace SeeSharp.Models
 
                     if (assessment.IsComplete)
                     {
-                        return assistantText;
+                        return await CompleteAndReturnAsync(assistantText, "completed")
+                            .ConfigureAwait(false);
                     }
 
                     if (completionValidationRetriesUsed >= MaxCompletionValidationRetries)
                     {
-                        return assistantText +
+                        return await CompleteAndReturnAsync(
+                            assistantText +
                             "\n\n[Validation note] Task may be incomplete: " +
                             (string.IsNullOrWhiteSpace(assessment.Gap)
                                 ? "No explicit completion evidence was found."
-                                : assessment.Gap);
+                                : assessment.Gap),
+                            "incomplete").ConfigureAwait(false);
                     }
 
                     completionValidationRetriesUsed++;
@@ -298,14 +343,27 @@ namespace SeeSharp.Models
                         Result = toolResult
                     });
                 }
-                lastToolOutputs = toolOutputs;
                 cumulativeToolOutputs.AddRange(toolOutputs);
+                await TryPersistAgentLoopTurnAsync(
+                        taskRunId,
+                        turn + 1,
+                        assistantText,
+                        invocations,
+                        toolOutputs,
+                        successfulToolExecutions,
+                        contextResetAttempts,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                await TryPersistToolExecutionsAsync(taskRunId, turn + 1, toolOutputs, cancellationToken)
+                    .ConfigureAwait(false);
 
                 successfulToolExecutions += CountSuccessfulToolExecutions(toolOutputs);
                 if (successfulToolExecutions > MaxSuccessfulToolExecutionsPerTask)
                 {
-                    return "Stopped: tool execution budget for this task was reached. Summarize what you have so far " +
-                        "and say what is still missing, without requesting more tools.";
+                    return await CompleteAndReturnAsync(
+                        "Stopped: tool execution budget for this task was reached. Summarize what you have so far " +
+                        "and say what is still missing, without requesting more tools.",
+                        "budget_exceeded").ConfigureAwait(false);
                 }
 
                 bool allSkippedThisTurn = toolOutputs.Count > 0 &&
@@ -323,8 +381,10 @@ namespace SeeSharp.Models
                 // tool: lines; require three to allow one recovery turn after a bad parse.
                 if (consecutiveAllSkippedTurns >= 3)
                 {
-                    return "Stopped: the model requested only duplicate tools already run this task. " +
-                        "Use the tool JSON already returned in the conversation to answer, or state what is blocking you.";
+                    return await CompleteAndReturnAsync(
+                        "Stopped: the model requested only duplicate tools already run this task. " +
+                        "Use the tool JSON already returned in the conversation to answer, or state what is blocking you.",
+                        "stalled").ConfigureAwait(false);
                 }
 
                 string progressSignature = BuildProgressSignature(toolOutputs);
@@ -339,7 +399,9 @@ namespace SeeSharp.Models
                 lastProgressSignature = progressSignature;
                 if (noProgressTurns >= MaxNoProgressTurns)
                 {
-                    return "Stopped early because tool execution stopped making progress (repeated duplicate/unchanged results).";
+                    return await CompleteAndReturnAsync(
+                        "Stopped early because tool execution stopped making progress (repeated duplicate/unchanged results).",
+                        "stalled").ConfigureAwait(false);
                 }
 
                 currentInput = await BuildToolBridgeMessageAsync(
@@ -354,7 +416,181 @@ namespace SeeSharp.Models
                     cancellationToken).ConfigureAwait(false);
             }
 
-            return "Stopped after max turns while resolving tool calls.";
+            return await CompleteAndReturnAsync(
+                "Stopped after max turns while resolving tool calls.",
+                "max_turns").ConfigureAwait(false);
+        }
+
+        private async Task TryPersistTaskRunStartAsync(
+            string taskRunId,
+            string taskText,
+            string repoContext,
+            long startedAtUnixMs,
+            CancellationToken cancellationToken)
+        {
+            if (_convexService is null)
+            {
+                return;
+            }
+
+            string repoSummary = string.IsNullOrWhiteSpace(repoContext)
+                ? ""
+                : (repoContext.Length <= 2_000 ? repoContext : repoContext[..2_000] + "\n[...truncated...]");
+
+            try
+            {
+                await _convexService.SaveTaskRunStartAsync(
+                    new TaskRunRecord
+                    {
+                        TaskRunId = taskRunId,
+                        ModelId = Model.Id,
+                        TaskText = taskText,
+                        Status = "running",
+                        RepoContextSummary = repoSummary,
+                        StartedAtUnixMs = startedAtUnixMs
+                    },
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error, $"[Convex] Failed to persist task run start: {ex.Message}");
+            }
+        }
+
+        private async Task TryPersistTaskRunCompletionAsync(
+            string taskRunId,
+            string status,
+            string finalAssistantText,
+            long completedAtUnixMs,
+            CancellationToken cancellationToken)
+        {
+            if (_convexService is null)
+            {
+                return;
+            }
+
+            string trimmedFinalText = string.IsNullOrWhiteSpace(finalAssistantText)
+                ? ""
+                : (finalAssistantText.Length <= 6_000
+                    ? finalAssistantText
+                    : finalAssistantText[..6_000] + "\n[...truncated...]");
+
+            try
+            {
+                await _convexService.CompleteTaskRunAsync(
+                    new TaskRunRecord
+                    {
+                        TaskRunId = taskRunId,
+                        ModelId = Model.Id,
+                        TaskText = "",
+                        Status = status,
+                        RepoContextSummary = "",
+                        StartedAtUnixMs = 0,
+                        CompletedAtUnixMs = completedAtUnixMs,
+                        FinalAssistantText = trimmedFinalText
+                    },
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error, $"[Convex] Failed to persist task run completion: {ex.Message}");
+            }
+        }
+
+        private async Task TryPersistAgentLoopTurnAsync(
+            string taskRunId,
+            int turnNumber,
+            string assistantText,
+            IReadOnlyList<(string toolName, Dictionary<string, object?> args)> invocations,
+            IReadOnlyList<ToolExecutionEnvelope> toolOutputs,
+            int successfulToolExecutionsSoFar,
+            int contextResetCount,
+            CancellationToken cancellationToken)
+        {
+            if (_convexService is null)
+            {
+                return;
+            }
+
+            try
+            {
+                string toolCallsJson = JsonSerializer.Serialize(invocations.Select(i => new
+                {
+                    toolName = i.toolName,
+                    args = i.args
+                }));
+                string toolResultsJson = JsonSerializer.Serialize(toolOutputs.Select(o => new
+                {
+                    toolName = o.ToolName,
+                    result = o.Result
+                }));
+
+                await _convexService.SaveAgentLoopTurnAsync(
+                    new AgentLoopTurnRecord
+                    {
+                        TaskRunId = taskRunId,
+                        TurnNumber = turnNumber,
+                        AssistantText = assistantText,
+                        ToolCallsJson = TruncateForPersistence(toolCallsJson, 8_000),
+                        ToolResultsJson = TruncateForPersistence(toolResultsJson, 16_000),
+                        SuccessfulToolExecutionsSoFar = successfulToolExecutionsSoFar,
+                        ContextResetCount = contextResetCount,
+                        CreatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    },
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error, $"[Convex] Failed to persist loop turn {turnNumber}: {ex.Message}");
+            }
+        }
+
+        private async Task TryPersistToolExecutionsAsync(
+            string taskRunId,
+            int turnNumber,
+            IReadOnlyList<ToolExecutionEnvelope> toolOutputs,
+            CancellationToken cancellationToken)
+        {
+            if (_convexService is null || toolOutputs.Count == 0)
+            {
+                return;
+            }
+
+            foreach (ToolExecutionEnvelope output in toolOutputs)
+            {
+                bool isSuccess = IsSuccessfulToolResult(output.Result);
+                try
+                {
+                    await _convexService.SaveToolExecutionAsync(
+                        new ToolExecutionRecord
+                        {
+                            TaskRunId = taskRunId,
+                            TurnNumber = turnNumber,
+                            ToolName = output.ToolName,
+                            ArgsJson = TruncateForPersistence(JsonSerializer.Serialize(output.Args), 8_000),
+                            ResultJson = TruncateForPersistence(JsonSerializer.Serialize(output.Result), 16_000),
+                            Ok = isSuccess,
+                            CreatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                        },
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    ThemedConsole.WriteLine(
+                        TerminalTone.Error,
+                        $"[Convex] Failed to persist tool execution {output.ToolName} (turn {turnNumber}): {ex.Message}");
+                }
+            }
+        }
+
+        private static string TruncateForPersistence(string text, int maxChars)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length <= maxChars)
+            {
+                return text;
+            }
+
+            return text[..maxChars] + "\n[...truncated for persistence size...]";
         }
 
         private static async Task LlmProgressLoopAsync(
