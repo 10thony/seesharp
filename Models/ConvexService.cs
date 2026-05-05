@@ -104,39 +104,77 @@ public sealed class ConvexService : IAsyncDisposable
 
     private static async Task<ConvexConfig> LoadRequiredConfigAsync(CancellationToken cancellationToken)
     {
-        string? envUrl = Environment.GetEnvironmentVariable("CONVEX_SELF_HOSTED_URL");
-        string? envAdminKey = Environment.GetEnvironmentVariable("CONVEX_SELF_HOSTED_ADMIN_KEY");
+        string repoRoot = ResolveSeeSharpRepoRoot();
+        string envFile = Path.Combine(repoRoot, "infra", ".env.local");
+        ConvexConfig? fileConfig = null;
+        if (File.Exists(envFile))
+        {
+            Dictionary<string, string> kv = await ParseDotEnvAsync(envFile, cancellationToken).ConfigureAwait(false);
+            string? fileUrl = FirstNonEmpty(
+                kv,
+                "CONVEX_URL",
+                "CONVEX_CLOUD_URL",
+                "CONVEX_SELF_HOSTED_URL");
+            string? fileAdminKey = FirstNonEmpty(
+                kv,
+                "CONVEX_ADMIN_KEY",
+                "CONVEX_DEPLOY_KEY",
+                "CONVEX_SELF_HOSTED_ADMIN_KEY");
+            if (!string.IsNullOrWhiteSpace(fileUrl) &&
+                !string.IsNullOrWhiteSpace(fileUrl) &&
+                !string.IsNullOrWhiteSpace(fileAdminKey))
+            {
+                fileConfig = new ConvexConfig
+                {
+                    DeploymentUrl = NormalizeConfigValue(fileUrl),
+                    AdminKey = NormalizeConfigValue(fileAdminKey)
+                };
+            }
+        }
+
+        string? envUrl = FirstNonEmpty(
+            Environment.GetEnvironmentVariable("CONVEX_URL"),
+            Environment.GetEnvironmentVariable("CONVEX_CLOUD_URL"),
+            Environment.GetEnvironmentVariable("CONVEX_SELF_HOSTED_URL"));
+        string? envAdminKey = FirstNonEmpty(
+            Environment.GetEnvironmentVariable("CONVEX_ADMIN_KEY"),
+            Environment.GetEnvironmentVariable("CONVEX_DEPLOY_KEY"),
+            Environment.GetEnvironmentVariable("CONVEX_SELF_HOSTED_ADMIN_KEY"));
+        ConvexConfig? envConfig = null;
         if (!string.IsNullOrWhiteSpace(envUrl) && !string.IsNullOrWhiteSpace(envAdminKey))
         {
-            return new ConvexConfig
+            envConfig = new ConvexConfig
             {
-                DeploymentUrl = envUrl.Trim(),
-                AdminKey = envAdminKey.Trim()
+                DeploymentUrl = NormalizeConfigValue(envUrl),
+                AdminKey = NormalizeConfigValue(envAdminKey)
             };
         }
 
-        string repoRoot = ResolveSeeSharpRepoRoot();
-        string envFile = Path.Combine(repoRoot, "infra", ".env.local");
-        if (!File.Exists(envFile))
+        if (fileConfig is not null)
         {
-            throw new InvalidOperationException(
-                "Convex configuration was not found. Set CONVEX_SELF_HOSTED_URL and CONVEX_SELF_HOSTED_ADMIN_KEY, " +
-                "or create infra/.env.local.");
+            if (envConfig is not null &&
+                (!string.Equals(fileConfig.DeploymentUrl, envConfig.DeploymentUrl, StringComparison.Ordinal) ||
+                 !string.Equals(fileConfig.AdminKey, envConfig.AdminKey, StringComparison.Ordinal)))
+            {
+                ThemedConsole.WriteLine(
+                    TerminalTone.Reasoning,
+                    "[Convex] Using infra/.env.local credentials; process environment values differ.");
+            }
+
+            return fileConfig;
         }
 
-        Dictionary<string, string> kv = await ParseDotEnvAsync(envFile, cancellationToken).ConfigureAwait(false);
-        if (!kv.TryGetValue("CONVEX_SELF_HOSTED_URL", out string? fileUrl) || string.IsNullOrWhiteSpace(fileUrl) ||
-            !kv.TryGetValue("CONVEX_SELF_HOSTED_ADMIN_KEY", out string? fileAdminKey) || string.IsNullOrWhiteSpace(fileAdminKey))
+        if (envConfig is not null)
         {
-            throw new InvalidOperationException(
-                "Missing CONVEX_SELF_HOSTED_URL and/or CONVEX_SELF_HOSTED_ADMIN_KEY in infra/.env.local.");
+            ThemedConsole.WriteLine(
+                TerminalTone.Reasoning,
+                "[Convex] Using process environment credentials.");
+            return envConfig;
         }
 
-        return new ConvexConfig
-        {
-            DeploymentUrl = fileUrl.Trim(),
-            AdminKey = fileAdminKey.Trim()
-        };
+        throw new InvalidOperationException(
+            "Convex configuration was not found. Set CONVEX_URL and CONVEX_DEPLOY_KEY (or CONVEX_ADMIN_KEY), " +
+            "or create infra/.env.local. Backward-compatible self-hosted names are also supported.");
     }
 
     private static string ResolveSeeSharpRepoRoot()
@@ -172,7 +210,7 @@ public sealed class ConvexService : IAsyncDisposable
             }
 
             string key = line[..idx].Trim();
-            string value = line[(idx + 1)..].Trim().Trim('"');
+            string value = line[(idx + 1)..].Trim().Trim('"').Trim('\'');
             if (key.Length == 0)
             {
                 continue;
@@ -182,5 +220,36 @@ public sealed class ConvexService : IAsyncDisposable
         }
 
         return result;
+    }
+
+    private static string NormalizeConfigValue(string value)
+    {
+        return value.Trim().Trim('"').Trim('\'');
+    }
+
+    private static string? FirstNonEmpty(Dictionary<string, string> values, params string[] keys)
+    {
+        foreach (string key in keys)
+        {
+            if (values.TryGetValue(key, out string? value) && !string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? FirstNonEmpty(params string?[] values)
+    {
+        foreach (string? value in values)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return null;
     }
 }

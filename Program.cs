@@ -8,9 +8,11 @@ using SeeSharp.Dev;
 using SeeSharp.Models;
 using System.ClientModel;
 using System.Diagnostics;
+using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 // Traffic goes only to LM Studio. The OpenAI .NET SDK is used because LM
 // Studio exposes the same /v1 routes
@@ -55,55 +57,89 @@ await using ConvexService convexService = await ConvexService.CreateFromLocalEnv
 List<OpenAIModel> models = (await lmStudioModelsClient
     .GetModelsAsync(cts.Token)).Value.ToList();
 
-if (!LocalTestProjectMenu.IsLegacyAllModelsMode(args))
+HashSet<string> activeModelIds = new(StringComparer.OrdinalIgnoreCase);
+void MarkModelActive(string modelId)
 {
-    await LocalTestProjectMenu.RunAsync(
-        credential, clientOptions, models, contextualizerChatClient, convexService, cts.Token);
-    return;
+    if (!string.IsNullOrWhiteSpace(modelId))
+    {
+        _ = activeModelIds.Add(modelId.Trim());
+    }
 }
+MarkModelActive(contextualizerModelId);
 
+int[] unloadOnceGate = [0];
+Action unloadLoadedModelsOnExit = CreateUnloadLoadedModelsAction(
+    () => activeModelIds,
+    lmStudioBaseUri,
+    apiKey,
+    unloadOnceGate);
+AppDomain.CurrentDomain.ProcessExit += (_, _) => unloadLoadedModelsOnExit();
+Console.CancelKeyPress += (_, _) => unloadLoadedModelsOnExit();
 
-List<string> questions = new List<string>()
+try
 {
-    //"Read the Program.cs file and tell me what it does.",
-    //"Edit the Agent.cs file so it is a regular class instead of an abstract class.",
-    //"what does cobec inc do? here is there homepage: https://www.cobec.com/",
-    //"List the files in the codebase, study what there is, determine the most important files to read," +
-    //" and tell me what this app does.",
-    //"How can i build this program?",
-    //"Study this codebase and let me know what it does."
-    //"List the files in the codebase, study what there is, determine the most important files to read," +
-    //" and tell me what this app does.",
-    //"How can i build this program?",
-    //"Study this codebase and let me know what it does."
-    "Turn on the postgres docker container named testpostgres",
-    "Create a SQL file to create a user table with columns for ID" +
-        " (auto generated and incrementing Primary Key), name, role_id," +
-        "labor_category_code, ",
-    "Create a SQL script that creates an item with columns for, ID " +
-        "(auto generated and incrementing primary key)" +
-        "name, description, cost, manufacturer, location, owner (user id foreign key)," +
-        " status (item status lookup value)",
-    "Create a SQL script that creates an item status lookup table with values for" +
-        " active, inactive, and archived",
-    "Create a SQL script that creates a role lookup table with values for admin, user",
-    "Create a SQL script that creates a labor category lookup table with values for " +
-        "full time, part time, contractor,",
-    "Create a SQL Script that loads our postgres container with entities for the tables it contains.",
+    if (!LocalTestProjectMenu.IsLegacyAllModelsMode(args))
+    {
+        await LocalTestProjectMenu.RunAsync(
+            credential,
+            clientOptions,
+            models,
+            contextualizerChatClient,
+            convexService,
+            contextualizerModelId,
+            (keepOnlyIds, token) => KeepOnlyModelsLoadedAsync(models, keepOnlyIds, lmStudioBaseUri, apiKey, token),
+            MarkModelActive,
+            cts.Token);
+        return;
+    }
 
-};
+    List<string> questions = new List<string>()
+    {
+        //"Read the Program.cs file and tell me what it does.",
+        //"Edit the Agent.cs file so it is a regular class instead of an abstract class.",
+        //"what does cobec inc do? here is there homepage: https://www.cobec.com/",
+        //"List the files in the codebase, study what there is, determine the most important files to read," +
+        //" and tell me what this app does.",
+        //"How can i build this program?",
+        //"Study this codebase and let me know what it does."
+        //"List the files in the codebase, study what there is, determine the most important files to read," +
+        //" and tell me what this app does.",
+        //"How can i build this program?",
+        //"Study this codebase and let me know what it does."
+        "Turn on the postgres docker container named testpostgres",
+        "Create a SQL file to create a user table with columns for ID" +
+            " (auto generated and incrementing Primary Key), name, role_id," +
+            "labor_category_code, ",
+        "Create a SQL script that creates an item with columns for, ID " +
+            "(auto generated and incrementing primary key)" +
+            "name, description, cost, manufacturer, location, owner (user id foreign key)," +
+            " status (item status lookup value)",
+        "Create a SQL script that creates an item status lookup table with values for" +
+            " active, inactive, and archived",
+        "Create a SQL script that creates a role lookup table with values for admin, user",
+        "Create a SQL script that creates a labor category lookup table with values for " +
+            "full time, part time, contractor,",
+        "Create a SQL Script that loads our postgres container with entities for the tables it contains.",
 
-LMStudioToolKit toolKit = new LMStudioToolKit();
+    };
 
-foreach (OpenAIModel model in models)
+    LMStudioToolKit toolKit = new LMStudioToolKit();
+
+    foreach (OpenAIModel model in models)
+    {
+        MarkModelActive(model.Id);
+        LMStudioAgent agent = new(model, toolKit, contextualizerChatClient, convexService);
+
+
+        StringBuilder agentLoopStrings = await
+               agent.AgentLoop(new ResponsesClient(credential, clientOptions),
+                               questions,
+                               cts.Token);
+    }
+}
+finally
 {
-    LMStudioAgent agent = new(model, toolKit, contextualizerChatClient, convexService);
-
-
-    StringBuilder agentLoopStrings = await
-           agent.AgentLoop(new ResponsesClient(credential, clientOptions),
-                           questions,
-                           cts.Token);
+    unloadLoadedModelsOnExit();
 }
 
 
@@ -218,6 +254,139 @@ static OpenAIModel PromptUserToSelectModel(string userInput, List<OpenAIModel> m
     }
 
     return models[selectedModelIndex];
+}
+
+static Action CreateUnloadLoadedModelsAction(
+    Func<IEnumerable<string>> modelIdsProvider,
+    string lmStudioBaseUri,
+    string apiKey,
+    int[] unloadOnceGate)
+{
+    return () =>
+    {
+        if (Interlocked.Exchange(ref unloadOnceGate[0], 1) != 0)
+        {
+            return;
+        }
+
+        string[] modelIds = modelIdsProvider()
+            .Where(static id => !string.IsNullOrWhiteSpace(id))
+            .Select(static id => id.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (modelIds.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Task.Run(async () =>
+            {
+                foreach (string modelId in modelIds)
+                {
+                    await TryUnloadModelAsync(lmStudioBaseUri, apiKey, modelId)
+                        .ConfigureAwait(false);
+                }
+            }).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            ThemedConsole.WriteLine(TerminalTone.Error,
+                $"[Shutdown] Model unload failed: {ex.Message}");
+        }
+    };
+}
+
+static async Task TryUnloadModelAsync(string lmStudioBaseUri, string apiKey, string modelId)
+{
+    Uri baseUri = new Uri(lmStudioBaseUri.TrimEnd('/') + "/", UriKind.Absolute);
+    using HttpClient http = new HttpClient
+    {
+        Timeout = TimeSpan.FromSeconds(8)
+    };
+    http.DefaultRequestHeaders.Authorization =
+        new AuthenticationHeaderValue("Bearer", apiKey);
+
+    // LM Studio endpoint compatibility can vary by version. Try known unload routes.
+    string[] routes =
+    [
+        "models/unload",
+        "../api/v0/models/unload",
+        "../api/v0/model/unload"
+    ];
+    bool unloaded = false;
+
+    foreach (string route in routes)
+    {
+        Uri requestUri = new Uri(baseUri, route);
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(new { model = modelId }),
+                    Encoding.UTF8,
+                    "application/json")
+            };
+            using HttpResponseMessage response = await http
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead)
+                .ConfigureAwait(false);
+            if (response.IsSuccessStatusCode)
+            {
+                unloaded = true;
+                ThemedConsole.WriteLine(
+                    TerminalTone.Reasoning,
+                    $"[Shutdown] Unloaded model: {modelId}");
+                return;
+            }
+        }
+        catch
+        {
+            // Best effort on shutdown; try the next known route.
+        }
+    }
+
+    if (!unloaded)
+    {
+        ThemedConsole.WriteLine(
+            TerminalTone.Error,
+            $"[Shutdown] Could not unload model via known LM Studio routes: {modelId}");
+    }
+}
+
+static async Task KeepOnlyModelsLoadedAsync(
+    IReadOnlyList<OpenAIModel> currentlyLoadedModels,
+    IReadOnlyCollection<string> keepModelIds,
+    string lmStudioBaseUri,
+    string apiKey,
+    CancellationToken cancellationToken)
+{
+    HashSet<string> keep = new HashSet<string>(
+        keepModelIds
+            .Where(static id => !string.IsNullOrWhiteSpace(id))
+            .Select(static id => id.Trim()),
+        StringComparer.OrdinalIgnoreCase);
+
+    if (keep.Count == 0)
+    {
+        return;
+    }
+
+    string[] unloadCandidates = currentlyLoadedModels
+        .Select(static m => m.Id)
+        .Where(static id => !string.IsNullOrWhiteSpace(id))
+        .Select(static id => id.Trim())
+        .Where(id => !keep.Contains(id))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+    foreach (string modelId in unloadCandidates)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await TryUnloadModelAsync(lmStudioBaseUri, apiKey, modelId).ConfigureAwait(false);
+    }
 }
 #endregion
 
