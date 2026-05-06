@@ -1,7 +1,6 @@
 ﻿using OpenAI.Chat;
 using OpenAI.Models;
 using OpenAI.Responses;
-using SeeSharp.Models.Persistence;
 using System;
 using System.ClientModel;
 using System.ClientModel.Primitives;
@@ -19,9 +18,8 @@ namespace SeeSharp.Models
     public class LMStudioAgent(
         OpenAIModel model,
         ToolKit toolRegistry,
-        ChatClient contextualizerChatClient,
-        ConvexService? convexService = null)
-        : Agent(model, toolRegistry, contextualizerChatClient, convexService)
+        ChatClient contextualizerChatClient)
+        : Agent(model, toolRegistry, contextualizerChatClient)
     {
     }
 
@@ -53,17 +51,14 @@ namespace SeeSharp.Models
         public OpenAIModel Model { get; set; }
         private ToolKit ToolKit { get; set;  }
         private readonly ChatClient? _contextualizerChatClient;
-        private readonly ConvexService? _convexService;
         
         public Agent(OpenAIModel model,
                      ToolKit toolRegistry,
-                     ChatClient? contextualizerChatClient = null,
-                     ConvexService? convexService = null)
+                     ChatClient? contextualizerChatClient = null)
         {
             this.Model = model;
             this.ToolKit = toolRegistry;
             _contextualizerChatClient = contextualizerChatClient;
-            _convexService = convexService;
         }
 
         public async Task<StringBuilder> AgentLoop(
@@ -148,22 +143,8 @@ namespace SeeSharp.Models
             string repoContext,
             CancellationToken cancellationToken)
         {
-            string taskRunId = Guid.NewGuid().ToString("N");
-            long startedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            await TryPersistTaskRunStartAsync(taskRunId, task, repoContext, startedAt, cancellationToken)
-                .ConfigureAwait(false);
-
-            async Task<string> CompleteAndReturnAsync(string finalText, string status)
-            {
-                await TryPersistTaskRunCompletionAsync(
-                        taskRunId,
-                        status,
-                        finalText,
-                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                return finalText;
-            }
+            static Task<string> CompleteAndReturnAsync(string finalText, string _status) =>
+                Task.FromResult(finalText);
 
             string currentInput = task;
             string lastAssistantText = "";
@@ -267,17 +248,6 @@ namespace SeeSharp.Models
 
                 if (invocations.Count == 0)
                 {
-                    await TryPersistAgentLoopTurnAsync(
-                            taskRunId,
-                            turn + 1,
-                            assistantText,
-                            Array.Empty<(string toolName, Dictionary<string, object?> args)>(),
-                            Array.Empty<ToolExecutionEnvelope>(),
-                            successfulToolExecutions,
-                            contextResetAttempts,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-
                     TaskCompletionAssessment assessment = await AssessTaskCompletionAsync(
                         responsesClient,
                         task,
@@ -344,18 +314,6 @@ namespace SeeSharp.Models
                     });
                 }
                 cumulativeToolOutputs.AddRange(toolOutputs);
-                await TryPersistAgentLoopTurnAsync(
-                        taskRunId,
-                        turn + 1,
-                        assistantText,
-                        invocations,
-                        toolOutputs,
-                        successfulToolExecutions,
-                        contextResetAttempts,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                await TryPersistToolExecutionsAsync(taskRunId, turn + 1, toolOutputs, cancellationToken)
-                    .ConfigureAwait(false);
 
                 successfulToolExecutions += CountSuccessfulToolExecutions(toolOutputs);
                 if (successfulToolExecutions > MaxSuccessfulToolExecutionsPerTask)
@@ -419,178 +377,6 @@ namespace SeeSharp.Models
             return await CompleteAndReturnAsync(
                 "Stopped after max turns while resolving tool calls.",
                 "max_turns").ConfigureAwait(false);
-        }
-
-        private async Task TryPersistTaskRunStartAsync(
-            string taskRunId,
-            string taskText,
-            string repoContext,
-            long startedAtUnixMs,
-            CancellationToken cancellationToken)
-        {
-            if (_convexService is null)
-            {
-                return;
-            }
-
-            string repoSummary = string.IsNullOrWhiteSpace(repoContext)
-                ? ""
-                : (repoContext.Length <= 2_000 ? repoContext : repoContext[..2_000] + "\n[...truncated...]");
-
-            try
-            {
-                await _convexService.SaveTaskRunStartAsync(
-                    new TaskRunRecord
-                    {
-                        TaskRunId = taskRunId,
-                        ModelId = Model.Id,
-                        TaskText = taskText,
-                        Status = "running",
-                        RepoContextSummary = repoSummary,
-                        StartedAtUnixMs = startedAtUnixMs
-                    },
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                ThemedConsole.WriteLine(TerminalTone.Error, $"[Convex] Failed to persist task run start: {ex.Message}");
-            }
-        }
-
-        private async Task TryPersistTaskRunCompletionAsync(
-            string taskRunId,
-            string status,
-            string finalAssistantText,
-            long completedAtUnixMs,
-            CancellationToken cancellationToken)
-        {
-            if (_convexService is null)
-            {
-                return;
-            }
-
-            string trimmedFinalText = string.IsNullOrWhiteSpace(finalAssistantText)
-                ? ""
-                : (finalAssistantText.Length <= 6_000
-                    ? finalAssistantText
-                    : finalAssistantText[..6_000] + "\n[...truncated...]");
-
-            try
-            {
-                await _convexService.CompleteTaskRunAsync(
-                    new TaskRunRecord
-                    {
-                        TaskRunId = taskRunId,
-                        ModelId = Model.Id,
-                        TaskText = "",
-                        Status = status,
-                        RepoContextSummary = "",
-                        StartedAtUnixMs = 0,
-                        CompletedAtUnixMs = completedAtUnixMs,
-                        FinalAssistantText = trimmedFinalText
-                    },
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                ThemedConsole.WriteLine(TerminalTone.Error, $"[Convex] Failed to persist task run completion: {ex.Message}");
-            }
-        }
-
-        private async Task TryPersistAgentLoopTurnAsync(
-            string taskRunId,
-            int turnNumber,
-            string assistantText,
-            IReadOnlyList<(string toolName, Dictionary<string, object?> args)> invocations,
-            IReadOnlyList<ToolExecutionEnvelope> toolOutputs,
-            int successfulToolExecutionsSoFar,
-            int contextResetCount,
-            CancellationToken cancellationToken)
-        {
-            if (_convexService is null)
-            {
-                return;
-            }
-
-            try
-            {
-                string toolCallsJson = JsonSerializer.Serialize(invocations.Select(i => new
-                {
-                    toolName = i.toolName,
-                    args = i.args
-                }));
-                string toolResultsJson = JsonSerializer.Serialize(toolOutputs.Select(o => new
-                {
-                    toolName = o.ToolName,
-                    result = o.Result
-                }));
-
-                await _convexService.SaveAgentLoopTurnAsync(
-                    new AgentLoopTurnRecord
-                    {
-                        TaskRunId = taskRunId,
-                        TurnNumber = turnNumber,
-                        AssistantText = assistantText,
-                        ToolCallsJson = TruncateForPersistence(toolCallsJson, 8_000),
-                        ToolResultsJson = TruncateForPersistence(toolResultsJson, 16_000),
-                        SuccessfulToolExecutionsSoFar = successfulToolExecutionsSoFar,
-                        ContextResetCount = contextResetCount,
-                        CreatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-                    },
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                ThemedConsole.WriteLine(TerminalTone.Error, $"[Convex] Failed to persist loop turn {turnNumber}: {ex.Message}");
-            }
-        }
-
-        private async Task TryPersistToolExecutionsAsync(
-            string taskRunId,
-            int turnNumber,
-            IReadOnlyList<ToolExecutionEnvelope> toolOutputs,
-            CancellationToken cancellationToken)
-        {
-            if (_convexService is null || toolOutputs.Count == 0)
-            {
-                return;
-            }
-
-            foreach (ToolExecutionEnvelope output in toolOutputs)
-            {
-                bool isSuccess = IsSuccessfulToolResult(output.Result);
-                try
-                {
-                    await _convexService.SaveToolExecutionAsync(
-                        new ToolExecutionRecord
-                        {
-                            TaskRunId = taskRunId,
-                            TurnNumber = turnNumber,
-                            ToolName = output.ToolName,
-                            ArgsJson = TruncateForPersistence(JsonSerializer.Serialize(output.Args), 8_000),
-                            ResultJson = TruncateForPersistence(JsonSerializer.Serialize(output.Result), 16_000),
-                            Ok = isSuccess,
-                            CreatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-                        },
-                        cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    ThemedConsole.WriteLine(
-                        TerminalTone.Error,
-                        $"[Convex] Failed to persist tool execution {output.ToolName} (turn {turnNumber}): {ex.Message}");
-                }
-            }
-        }
-
-        private static string TruncateForPersistence(string text, int maxChars)
-        {
-            if (string.IsNullOrEmpty(text) || text.Length <= maxChars)
-            {
-                return text;
-            }
-
-            return text[..maxChars] + "\n[...truncated for persistence size...]";
         }
 
         private static async Task LlmProgressLoopAsync(

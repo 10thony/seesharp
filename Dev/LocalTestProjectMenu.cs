@@ -57,7 +57,6 @@ public static class LocalTestProjectMenu
         OpenAIClientOptions clientOptions,
         IReadOnlyList<OpenAIModel> models,
         ChatClient contextualizerChatClient,
-        ConvexService convexService,
         string contextualizerModelId,
         Func<IReadOnlyCollection<string>, CancellationToken, Task>? keepOnlyModelsLoadedAsync,
         Action<string>? onModelActivated,
@@ -89,7 +88,6 @@ public static class LocalTestProjectMenu
                 clientOptions,
                 models,
                 contextualizerChatClient,
-                convexService,
                 contextualizerModelId,
                 keepOnlyModelsLoadedAsync,
                 onModelActivated,
@@ -132,7 +130,7 @@ public static class LocalTestProjectMenu
         }
 
         var toolKit = new LMStudioToolKit();
-        var agent = new LMStudioAgent(firstModel, toolKit, contextualizerChatClient, convexService);
+        var agent = new LMStudioAgent(firstModel, toolKit, contextualizerChatClient);
         var taskListForLoop = new List<string>(taskList);
         _ = await agent.AgentLoop(
             new ResponsesClient(credential, clientOptions),
@@ -186,7 +184,6 @@ public static class LocalTestProjectMenu
         OpenAIClientOptions clientOptions,
         IReadOnlyList<OpenAIModel> models,
         ChatClient contextualizerChatClient,
-        ConvexService convexService,
         string contextualizerModelId,
         Func<IReadOnlyCollection<string>, CancellationToken, Task>? keepOnlyModelsLoadedAsync,
         Action<string>? onModelActivated,
@@ -292,7 +289,7 @@ public static class LocalTestProjectMenu
             ThemedConsole.WriteLine(TerminalTone.Reasoning,
                 $"[TestHarness] Running project loop {i + 1}/{projects.Count} at {projectDir}");
 
-            var agent = new LMStudioAgent(model, toolKit, contextualizerChatClient, convexService);
+            var agent = new LMStudioAgent(model, toolKit, contextualizerChatClient);
             _ = await agent.AgentLoop(responsesClient, new List<string>(tasks), cancellationToken);
         }
     }

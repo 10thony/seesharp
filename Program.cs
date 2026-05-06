@@ -53,7 +53,6 @@ availableModelsSB.AppendLine("LM Studio — select a loaded model:");
 
 
 using var cts = new CancellationTokenSource();
-await using ConvexService convexService = await ConvexService.CreateFromLocalEnvAsync(cts.Token);
 List<OpenAIModel> models = (await lmStudioModelsClient
     .GetModelsAsync(cts.Token)).Value.ToList();
 
@@ -85,7 +84,6 @@ try
             clientOptions,
             models,
             contextualizerChatClient,
-            convexService,
             contextualizerModelId,
             (keepOnlyIds, token) => KeepOnlyModelsLoadedAsync(models, keepOnlyIds, lmStudioBaseUri, apiKey, token),
             MarkModelActive,
@@ -128,7 +126,7 @@ try
     foreach (OpenAIModel model in models)
     {
         MarkModelActive(model.Id);
-        LMStudioAgent agent = new(model, toolKit, contextualizerChatClient, convexService);
+        LMStudioAgent agent = new(model, toolKit, contextualizerChatClient);
 
 
         StringBuilder agentLoopStrings = await
