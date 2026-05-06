@@ -21,6 +21,7 @@ using System.Threading;
 
 #region functional running of the program
 ThemedConsole.Initialize();
+LoadDevelopmentEnvironmentFile(args);
 // Default path is the interactive test harness. Watch relaunch
 // runs only for --legacy (avoids host output interleaving with prompts when using
 // `dotnet run` without the debugger).
@@ -145,6 +146,88 @@ finally
 
 
 #region get models functions
+static void LoadDevelopmentEnvironmentFile(string[] args)
+{
+    if (!IsDevelopmentMode(args))
+    {
+        return;
+    }
+
+    string workspaceRoot = AgentUtilities.ResolveWorkspaceRoot();
+    string[] candidates =
+    [
+        ".env.development.local",
+        ".env.development",
+        ".env.local",
+        ".env"
+    ];
+
+    foreach (string filename in candidates)
+    {
+        string fullPath = Path.Combine(workspaceRoot, filename);
+        if (!File.Exists(fullPath))
+        {
+            continue;
+        }
+
+        int loaded = 0;
+        foreach (string raw in File.ReadAllLines(fullPath))
+        {
+            string line = raw.Trim();
+            if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            int idx = line.IndexOf('=');
+            if (idx <= 0)
+            {
+                continue;
+            }
+
+            string key = line[..idx].Trim();
+            string value = line[(idx + 1)..].Trim();
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                continue;
+            }
+
+            if ((value.StartsWith("\"", StringComparison.Ordinal) && value.EndsWith("\"", StringComparison.Ordinal)) ||
+                (value.StartsWith("'", StringComparison.Ordinal) && value.EndsWith("'", StringComparison.Ordinal)))
+            {
+                value = value[1..^1];
+            }
+
+            // Keep machine/shell-provided values as highest priority.
+            string? existing = Environment.GetEnvironmentVariable(key);
+            if (!string.IsNullOrWhiteSpace(existing))
+            {
+                continue;
+            }
+
+            Environment.SetEnvironmentVariable(key, value, EnvironmentVariableTarget.Process);
+            loaded++;
+        }
+
+        ThemedConsole.WriteLine(
+            TerminalTone.Reasoning,
+            $"[Env] Loaded {loaded} variable(s) from {filename} (dev mode).");
+        return;
+    }
+}
+
+static bool IsDevelopmentMode(string[] args)
+{
+    string? dotnetEnv = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT");
+    string? aspnetEnv = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT");
+    bool envSaysDevelopment =
+        string.Equals(dotnetEnv, "Development", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(aspnetEnv, "Development", StringComparison.OrdinalIgnoreCase);
+
+    // For this CLI app, treat debugger sessions and legacy harness mode as development mode.
+    return envSaysDevelopment || Debugger.IsAttached || LocalTestProjectMenu.IsLegacyAllModelsMode(args);
+}
+
 static bool TryRelaunchUnderDotnetWatch(string[] args)
 {
     if (string.Equals(Environment.

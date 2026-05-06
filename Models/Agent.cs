@@ -47,6 +47,8 @@ namespace SeeSharp.Models
         private const int MaxToolStringValueChars = 4_000;
         private const int MaxNoProgressTurns = 3;
         private const int MaxContextResetAttemptsPerTask = 3;
+        private const bool ShowPerTickModelWaitLogs = false;
+        private const bool StreamMainModelOutputByDefault = true;
 
         public OpenAIModel Model { get; set; }
         private ToolKit ToolKit { get; set;  }
@@ -176,6 +178,7 @@ namespace SeeSharp.Models
                             lmStudioResponsesClient: responsesClient,
                             repoContext: perTurnRepoContext,
                             compactPrompt: lowContextMode,
+                            streamOutput: IsMainModelStreamingEnabled(),
                             cancellation: ct),
                         cancellationToken).ConfigureAwait(false);
                 }
@@ -385,7 +388,8 @@ namespace SeeSharp.Models
             DateTime startUtc,
             TimeSpan maxDuration,
             CancellationToken telemetryStopToken,
-            CancellationToken requestToken)
+            CancellationToken requestToken,
+            Action? onTick = null)
         {
             while (!telemetryStopToken.IsCancellationRequested)
             {
@@ -405,9 +409,13 @@ namespace SeeSharp.Models
                 }
 
                 double elapsed = (DateTime.UtcNow - startUtc).TotalSeconds;
-                ThemedConsole.WriteLine(
-                    tone,
-                    $"{messagePrefix} still waiting for model… ({elapsed:F0}s / {maxDuration.TotalMinutes:F0}m max)");
+                onTick?.Invoke();
+                if (ShowPerTickModelWaitLogs)
+                {
+                    ThemedConsole.WriteLine(
+                        tone,
+                        $"{messagePrefix} still waiting for model… ({elapsed:F0}s / {maxDuration.TotalMinutes:F0}m max)");
+                }
             }
         }
 
@@ -426,9 +434,16 @@ namespace SeeSharp.Models
             DateTime start = DateTime.UtcNow;
             ThemedConsole.WriteLine(tone, $"{messagePrefix} (max {perCallTimeout.TotalMinutes:F0}m)…");
             using CancellationTokenSource telemetryCts = new();
+            int waitTicks = 0;
             Task telemetryTask = Task.Run(
                 () => LlmProgressLoopAsync(
-                    tone, messagePrefix, start, perCallTimeout, telemetryCts.Token, linked),
+                    tone,
+                    messagePrefix,
+                    start,
+                    perCallTimeout,
+                    telemetryCts.Token,
+                    linked,
+                    onTick: () => Interlocked.Increment(ref waitTicks)),
                 CancellationToken.None);
             try
             {
@@ -437,7 +452,7 @@ namespace SeeSharp.Models
                 {
                     ThemedConsole.WriteLine(
                         tone,
-                        $"{messagePrefix} completed in {(DateTime.UtcNow - start).TotalSeconds:F1}s");
+                        $"{messagePrefix} completed in {(DateTime.UtcNow - start).TotalSeconds:F1}s (wait ticks: {waitTicks})");
                 }
 
                 return result;
@@ -491,7 +506,7 @@ namespace SeeSharp.Models
             }
             else if (normalizedTool == AgentDefaults.BASH_TOOL_NAME && TryGetArgAsString(args, out string? command, "command"))
             {
-                keyMaterial = (command ?? "").Trim();
+                keyMaterial = NormalizeBashSignature((command ?? "").Trim());
             }
             else
             {
@@ -499,6 +514,28 @@ namespace SeeSharp.Models
             }
 
             return normalizedTool + "::" + keyMaterial;
+        }
+
+        private static string NormalizeBashSignature(string command)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                return "";
+            }
+
+            string normalized = Regex.Replace(command.Trim(), @"\s+", " ").ToLowerInvariant();
+            bool isRepoWideCsEnumeration =
+                Regex.IsMatch(normalized, @"\bget-childitem\b.*\b-recurse\b.*(\b-filter\b|\b-include\b).*\*\.cs") ||
+                Regex.IsMatch(normalized, @"\bget-childitem\b.*\b-recurse\b.*\b-file\b") ||
+                Regex.IsMatch(normalized, @"\bselect-string\b.*(\*\*/\*\.cs|'\*\*/\*\.cs'|""\*\*/\*\.cs"")") ||
+                Regex.IsMatch(normalized, @"\bfind\b\s+\.\s+-name\s+[""']?\*\.cs[""']?");
+
+            if (isRepoWideCsEnumeration)
+            {
+                return "broad_repo_csharp_enumeration";
+            }
+
+            return command;
         }
 
         private static bool TryGetArgAsString(
@@ -640,6 +677,7 @@ namespace SeeSharp.Models
                     lmStudioResponsesClient: responsesClient,
                     repoContext: repoContext,
                     compactPrompt: false,
+                    streamOutput: false,
                     cancellation: ct),
                 cancellationToken).ConfigureAwait(false);
 
@@ -1020,6 +1058,7 @@ namespace SeeSharp.Models
                         lmStudioResponsesClient: responsesClient,
                         repoContext: repoContext,
                         compactPrompt: false,
+                        streamOutput: false,
                         cancellation: ct),
                     cancellationToken).ConfigureAwait(false);
 
@@ -1723,7 +1762,13 @@ namespace SeeSharp.Models
             sb.AppendLine("- For Docker Compose, use service names from docker-compose.yml (not container_name) with commands like `docker compose up -d <service>`.");
             sb.AppendLine("- If any compose command reports unknown service, immediately run `docker compose config --services`, then retry with one exact service name from that list.");
             sb.AppendLine("Example Windows read: tool: BASH({\"command\":\"Get-Content Program.cs\"})");
+            sb.AppendLine("Example Windows targeted search by symbol: tool: BASH({\"command\":\"Get-ChildItem -Recurse -Filter '*.cs' | Select-String -Pattern 'TodoEndpoints|MapPost|MapPut' | Select-Object -First 20 Path,LineNumber,Line\"})");
+            sb.AppendLine("Example Windows targeted search by file: tool: BASH({\"command\":\"Select-String -Path 'Features/Todos/*.cs' -Pattern 'Results.BadRequest|Name' -Context 2,2\"})");
+            sb.AppendLine("Example Windows safe edit (single replace): tool: BASH({\"command\":\"$p='Features/Todos/TodoEndpoints.cs'; $c=Get-Content $p -Raw; $c=$c -replace 'old text','new text'; Set-Content $p $c\"})");
+            sb.AppendLine("Avoid broad repo listing loops like repeated `Get-ChildItem -Recurse` / `find . -name` variants unless absolutely required once.");
             sb.AppendLine("Example POSIX read: tool: BASH({\"command\":\"cat Program.cs\"})");
+            sb.AppendLine("Example POSIX targeted search: tool: BASH({\"command\":\"rg -n \\\"Map(Post|Put)|Results\\\\.BadRequest|Name\\\" .\"})");
+            sb.AppendLine("Example POSIX safe edit (single replace): tool: BASH({\"command\":\"python -c \\\"from pathlib import Path; p=Path('file.cs'); t=p.read_text(); p.write_text(t.replace('old','new',1))\\\"\"})");
             sb.AppendLine("Example web call: tool: WEB_CALL({\"url\":\"https://www.cobec.com/\"})");
             sb.AppendLine();
             sb.AppendLine("When tool results are provided, consume them and continue until the task is complete.");
@@ -1738,6 +1783,7 @@ namespace SeeSharp.Models
         ResponsesClient lmStudioResponsesClient,
         string? repoContext = null,
         bool compactPrompt = false,
+        bool streamOutput = false,
         CancellationToken cancellation = default)
             {
                 if (string.IsNullOrWhiteSpace(modelId))
@@ -1759,6 +1805,32 @@ namespace SeeSharp.Models
                         "Repository context (prepared offline):\n" + repoContext));
                 options.InputItems.Add(ResponseItem.CreateUserMessageItem(input));
 
+                if (streamOutput)
+                {
+                    options.StreamingEnabled = true;
+                    StringBuilder streamedText = new();
+                    await foreach (StreamingResponseUpdate update in lmStudioResponsesClient
+                        .CreateResponseStreamingAsync(options, cancellation))
+                    {
+                        if (update is StreamingResponseOutputTextDeltaUpdate textDelta &&
+                            !string.IsNullOrEmpty(textDelta.Delta))
+                        {
+                            streamedText.Append(textDelta.Delta);
+                            ThemedConsole.Write(TerminalTone.Agent, textDelta.Delta);
+                        }
+                    }
+
+                    if (streamedText.Length > 0)
+                    {
+                        ThemedConsole.WriteLine(TerminalTone.Agent, "");
+                        return new CreateResponseResult
+                        {
+                            ResponseId = "",
+                            ResponseContentText = streamedText.ToString()
+                        };
+                    }
+                }
+
                 ClientResult<ResponseResult> clientResult =
                     await lmStudioResponsesClient.CreateResponseAsync(options, cancellation).ConfigureAwait(false);
 
@@ -1776,6 +1848,7 @@ namespace SeeSharp.Models
             ResponsesClient lmStudioResponsesClient,
             string? repoContext,
             bool compactPrompt,
+            bool streamOutput,
             CancellationToken cancellation)
         {
             Exception? last = null;
@@ -1792,6 +1865,7 @@ namespace SeeSharp.Models
                         lmStudioResponsesClient: lmStudioResponsesClient,
                         repoContext: currentRepoContext,
                         compactPrompt: useCompactPrompt,
+                        streamOutput: streamOutput,
                         cancellation: cancellation).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
@@ -1850,6 +1924,19 @@ namespace SeeSharp.Models
             sb.AppendLine("- For docker compose, use service names from docker-compose.yml.");
             sb.AppendLine("Tool line format: tool: TOOL_NAME({\"arg\":\"value\"})");
             return sb.ToString();
+        }
+
+        private static bool IsMainModelStreamingEnabled()
+        {
+            string? env = Environment.GetEnvironmentVariable("SEESHARP_STREAM_MAIN_MODEL");
+            if (string.IsNullOrWhiteSpace(env))
+            {
+                return StreamMainModelOutputByDefault;
+            }
+
+            return !env.Equals("0", StringComparison.OrdinalIgnoreCase) &&
+                   !env.Equals("false", StringComparison.OrdinalIgnoreCase) &&
+                   !env.Equals("off", StringComparison.OrdinalIgnoreCase);
         }
 
         private sealed class ToolExecutionEnvelope
