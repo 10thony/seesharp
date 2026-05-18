@@ -1,0 +1,33 @@
+{
+  "$schema": "./seesharp.config.schema.json",
+  "_comment": "SeeSharp instance configuration. Edit this file or ask the agent to modify it.",
+  "agentName": "SeeSharp",
+  "limits": {
+    "maxAgentTurnsPerTask": 28,
+    "maxToolCallsPerTurn": 2,
+    "maxSuccessfulToolExecutionsPerTask": 22,
+    "bashCommandTimeoutSeconds": 30,
+    "responsesApiCallTimeoutMinutes": 10
+  },
+  "systemPrompt": {},
+  "contextualizer": {
+    "maxFilesToRead": 15,
+    "maxCharsPerFile": 48000,
+    "excludedDirectories": [
+      "bin",
+      "obj",
+      ".git",
+      "node_modules"
+    ],
+    "pinnedFiles": [
+      "Program.cs"
+    ]
+  },
+  "customTools": [],
+  "disabledTools": [],
+  "theme": {
+    "agentColor": "DarkCyan",
+    "toolColor": "Green",
+    "errorColor": "Red"
+  }
+}

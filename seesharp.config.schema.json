@@ -1,0 +1,246 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/jmartinez/seesharp/seesharp.config.schema.json",
+  "title": "SeeSharp Configuration",
+  "description": "Configuration schema for SeeSharp agent harness instances. Supports both global (~/.seesharp/config.json) and per-workspace (seesharp.config.json) files.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON schema reference for editor IntelliSense."
+    },
+    "_comment": {
+      "type": "string",
+      "description": "Human-readable comment (ignored by loader)."
+    },
+    "agentName": {
+      "type": "string",
+      "description": "Display name used in the system prompt identity. Default: 'SeeSharp'.",
+      "default": "SeeSharp"
+    },
+    "preferredModel": {
+      "type": ["string", "null"],
+      "description": "Preferred LM Studio model ID for the main agent. Null means use whatever is loaded."
+    },
+    "limits": {
+      "type": "object",
+      "description": "Agent execution limits and timeouts.",
+      "properties": {
+        "maxAgentTurnsPerTask": {
+          "type": "integer",
+          "description": "Maximum tool-loop turns per user task.",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 28
+        },
+        "maxToolCallsPerTurn": {
+          "type": "integer",
+          "description": "Maximum tool invocations extracted from a single assistant message.",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 2
+        },
+        "maxSuccessfulToolExecutionsPerTask": {
+          "type": "integer",
+          "description": "Hard cap on non-skipped tool executions per task.",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 22
+        },
+        "bashCommandTimeoutSeconds": {
+          "type": "integer",
+          "description": "Wall-clock cap (seconds) for a single BASH tool command.",
+          "minimum": 5,
+          "maximum": 600,
+          "default": 30
+        },
+        "responsesApiCallTimeoutMinutes": {
+          "type": "integer",
+          "description": "Per-request cap (minutes) for main model Responses API calls.",
+          "minimum": 1,
+          "maximum": 60,
+          "default": 10
+        },
+        "contextualizerCallTimeoutMinutes": {
+          "type": "integer",
+          "description": "Per-request cap (minutes) for contextualizer chat completion calls.",
+          "minimum": 1,
+          "maximum": 60,
+          "default": 10
+        },
+        "maxNoProgressTurns": {
+          "type": "integer",
+          "description": "Consecutive turns with identical tool signatures before stopping.",
+          "minimum": 1,
+          "maximum": 20,
+          "default": 3
+        },
+        "maxResponseRetries": {
+          "type": "integer",
+          "description": "Retry attempts for failed main model API calls.",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3
+        }
+      },
+      "additionalProperties": false
+    },
+    "systemPrompt": {
+      "type": "object",
+      "description": "Customize the system prompt sent to the main model.",
+      "properties": {
+        "prepend": {
+          "type": ["string", "null"],
+          "description": "Text inserted before the generated system prompt (e.g. personality, role)."
+        },
+        "append": {
+          "type": ["string", "null"],
+          "description": "Text appended after the generated system prompt (e.g. additional rules)."
+        },
+        "replace": {
+          "type": ["string", "null"],
+          "description": "If non-null, completely replaces the auto-generated system prompt. Use with caution."
+        }
+      },
+      "additionalProperties": false
+    },
+    "contextualizer": {
+      "type": "object",
+      "description": "Controls the contextualizer pipeline that indexes the workspace.",
+      "properties": {
+        "maxFilesToRead": {
+          "type": "integer",
+          "description": "Maximum files the contextualizer reads per run.",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 15
+        },
+        "maxCharsPerFile": {
+          "type": "integer",
+          "description": "Maximum characters read per file before truncation.",
+          "minimum": 500,
+          "maximum": 200000,
+          "default": 48000
+        },
+        "excludedDirectories": {
+          "type": "array",
+          "description": "Directory names to skip during workspace indexing.",
+          "items": { "type": "string" },
+          "default": ["bin", "obj", ".git", ".vs", ".idea", "node_modules"]
+        },
+        "pinnedFiles": {
+          "type": "array",
+          "description": "Relative paths always included first in the contextualizer file list.",
+          "items": { "type": "string" },
+          "default": ["Program.cs"]
+        },
+        "preferredModel": {
+          "type": ["string", "null"],
+          "description": "Override the contextualizer model ID (default from env or 'qwen/qwen3.5-2b')."
+        }
+      },
+      "additionalProperties": false
+    },
+    "customTools": {
+      "type": "array",
+      "description": "User-defined tools the agent can invoke.",
+      "items": {
+        "type": "object",
+        "required": ["name", "description", "type"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Tool name (uppercase, e.g. 'LINT_PROJECT'). Must not collide with built-in tools."
+          },
+          "description": {
+            "type": "string",
+            "description": "Human-readable description shown to the model in the tool registry."
+          },
+          "type": {
+            "type": "string",
+            "enum": ["bash", "http"],
+            "description": "Execution type: 'bash' runs a shell command, 'http' makes an HTTP request."
+          },
+          "command": {
+            "type": "string",
+            "description": "(bash type) Shell command template. Use {{paramName}} for parameter interpolation."
+          },
+          "workingDirectory": {
+            "type": ["string", "null"],
+            "description": "(bash type) Working directory (relative to workspace root)."
+          },
+          "timeoutSeconds": {
+            "type": "integer",
+            "description": "Execution timeout in seconds.",
+            "minimum": 1,
+            "maximum": 300,
+            "default": 30
+          },
+          "parameters": {
+            "type": "array",
+            "description": "Parameter names expected by the template.",
+            "items": { "type": "string" }
+          },
+          "method": {
+            "type": "string",
+            "enum": ["GET", "POST"],
+            "description": "(http type) HTTP method.",
+            "default": "GET"
+          },
+          "url": {
+            "type": "string",
+            "description": "(http type) URL template. Use {{paramName}} for interpolation."
+          },
+          "body": {
+            "type": ["string", "null"],
+            "description": "(http type) Request body template for POST requests."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "disabledTools": {
+      "type": "array",
+      "description": "Built-in tool names to hide from the model (e.g. ['LIST_FILE', 'READ_FILE']).",
+      "items": { "type": "string" }
+    },
+    "theme": {
+      "type": "object",
+      "description": "Console color overrides (use .NET ConsoleColor names).",
+      "properties": {
+        "agentColor": {
+          "type": "string",
+          "description": "Color for agent output text.",
+          "default": "DarkCyan"
+        },
+        "toolColor": {
+          "type": "string",
+          "description": "Color for tool execution output.",
+          "default": "Green"
+        },
+        "errorColor": {
+          "type": "string",
+          "description": "Color for error messages.",
+          "default": "Red"
+        },
+        "reasoningColor": {
+          "type": "string",
+          "description": "Color for reasoning/debug output.",
+          "default": "DarkCyan"
+        },
+        "userColor": {
+          "type": "string",
+          "description": "Color for user input display.",
+          "default": "Magenta"
+        },
+        "actionColor": {
+          "type": "string",
+          "description": "Color for action highlights.",
+          "default": "Yellow"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

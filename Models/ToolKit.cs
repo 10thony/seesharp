@@ -12,13 +12,52 @@ using System.Threading.Tasks;
 namespace SeeSharp.Models
 {
 
-    public class LMStudioToolKit : ToolKit
+    public partial class ToolKit
     {
-        
-    }
+        private readonly ResolvedConfig _config;
+        private int _configEditCallsThisTask;
+        private const int MaxConfigEditsPerTask = 3;
 
-    public abstract class ToolKit
-    {
+        public ToolKit() : this(AgentDefaults.ActiveConfig ?? new ResolvedConfig()) { }
+
+        public ToolKit(ResolvedConfig config)
+        {
+            _config = config;
+        }
+
+        public void ResetTaskState()
+        {
+            _configEditCallsThisTask = 0;
+        }
+
+        private static readonly Regex s_rawSqlStart = new(
+            @"^(CREATE|INSERT|UPDATE|DELETE|ALTER|DROP|TRUNCATE)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_fileWriteCmd = new(
+            @"\b(Set-Content|Add-Content|Out-File)\b|>>?|tee\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_sqlKeyword = new(
+            @"\b(CREATE\s+TABLE|INSERT\s+INTO|ALTER\s+TABLE|DROP\s+TABLE|REFERENCES)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_psPathArg = new(
+            @"-Path\s+(?<p>""[^""]+\.sql""|'[^']+\.sql'|[^\s;|&]+\.sql)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_redirPath = new(
+            @">>?\s*(?<p>""[^""]+\.sql""|'[^']+\.sql'|[^\s;|&]+\.sql)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_composeCmd = new(
+            @"^\s*docker\s+compose\s+(?<sub>[a-zA-Z]+)\b(?<rest>.*)$",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_composeTokenize = new(
+            @"(""[^""]*""|'[^']*'|\S+)",
+            RegexOptions.Compiled);
+        private static readonly Regex s_redirectTarget = new(
+            @"(?:^|[\s;])(?:\d)?>>?\s*(?<path>(?:""[^""]+""|'[^']+'|[^\s;|&]+))",
+            RegexOptions.Multiline | RegexOptions.Compiled);
+        private static readonly Regex s_lenientUnquoted = new(
+            @"^([^,}\r\n]+)",
+            RegexOptions.Compiled);
+
         /// <summary>
         /// This is how Agents get information about what tools they have access to and how to use them.
         /// Whenever you add a new tool, add a new entry in the dictionary returned by GetToolkitInformation()
@@ -48,8 +87,7 @@ namespace SeeSharp.Models
         /// </summary>
         public Dictionary<string, string> GetToolkitInformation()
         {
-
-            Dictionary<string, string> result = new Dictionary<string, string>();
+            Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
             result.Add(AgentDefaults.READ_TOOL_NAME,
                 "[DEPRECATED: prefer BASH] Gets the full content of a file. Relative filenames are resolved from the project/workspace root " +
@@ -79,6 +117,31 @@ namespace SeeSharp.Models
                 "    :param command: Command line to execute.\r\n" +
                 "    :param workingDirectory: Optional relative/absolute working directory.\r\n" +
                 "    :return: Exit code, stdout, stderr.");
+
+            result.Add(AgentDefaults.CONFIG_EDIT_TOOL_NAME,
+                "Reads or modifies the SeeSharp configuration for this workspace or globally.\r\n" +
+                "    :param action: \"read\" | \"set\" | \"remove\" — read returns current config, set updates a value, remove deletes a key.\r\n" +
+                "    :param scope: \"workspace\" | \"global\" — which config file to target.\r\n" +
+                "    :param path: Dot-delimited config path (e.g. \"limits.bashCommandTimeoutSeconds\", \"agentName\").\r\n" +
+                "    :param value: New value for set action (string, number, or JSON array/object).\r\n" +
+                "    :return: Updated config section or confirmation.");
+
+            // Merge user-defined custom tools from config
+            foreach (CustomToolDefinition customTool in _config.CustomTools)
+            {
+                if (string.IsNullOrWhiteSpace(customTool.Name))
+                    continue;
+                string paramHint = customTool.Parameters is { Count: > 0 }
+                    ? $"\r\n    :params: {string.Join(", ", customTool.Parameters)}"
+                    : "";
+                result[customTool.Name] = customTool.Description + paramHint;
+            }
+
+            // Remove disabled tools
+            foreach (string disabled in _config.DisabledTools)
+            {
+                result.Remove(disabled);
+            }
 
             return result;
         }
@@ -177,7 +240,7 @@ namespace SeeSharp.Models
             return result;
         }
 
-        public Dictionary<string, object> WebCall_Tool(string url)
+        public async Task<Dictionary<string, object>> WebCall_ToolAsync(string url)
         {
             var result = new Dictionary<string, object>();
             try
@@ -194,8 +257,8 @@ namespace SeeSharp.Models
                 ThemedConsole.WriteLine(TerminalTone.Tool, $"[Tool] WEB_CALL GET: {uri}");
 
                 using HttpClient http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-                using HttpResponseMessage response = http.GetAsync(uri).GetAwaiter().GetResult();
-                string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                using HttpResponseMessage response = await http.GetAsync(uri).ConfigureAwait(false);
+                string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                 if (body.Length > 25_000)
                 {
@@ -218,22 +281,12 @@ namespace SeeSharp.Models
             }
         }
 
-        public Dictionary<string, object> Bash_Tool(string command, string? workingDirectory = null)
+        public Task<Dictionary<string, object>> Bash_ToolAsync(string command, string? workingDirectory = null)
         {
-            try
-            {
-                return Bash_ToolAsync(command, workingDirectory).GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                return new Dictionary<string, object>
-                {
-                    { "error", ex.Message }
-                };
-            }
+            return Bash_ToolCoreAsync(command, workingDirectory);
         }
 
-        private static async Task<Dictionary<string, object>> Bash_ToolAsync(string command, string? workingDirectory)
+        private static async Task<Dictionary<string, object>> Bash_ToolCoreAsync(string command, string? workingDirectory)
         {
             string root = AgentUtilities.ResolveWorkspaceRoot();
             string resolvedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
@@ -375,7 +428,7 @@ namespace SeeSharp.Models
 
         private static bool LooksLikeRawSqlCommand(string command) =>
             !string.IsNullOrWhiteSpace(command) &&
-            Regex.IsMatch(command.TrimStart(), @"^(CREATE|INSERT|UPDATE|DELETE|ALTER|DROP|TRUNCATE)\b", RegexOptions.IgnoreCase);
+            s_rawSqlStart.IsMatch(command.TrimStart());
 
         private static bool LooksLikeEscapedSqlWriteCommand(string command)
         {
@@ -384,19 +437,13 @@ namespace SeeSharp.Models
                 return false;
             }
 
-            bool writesFile = Regex.IsMatch(
-                command,
-                @"\b(Set-Content|Add-Content|Out-File)\b|>>?|tee\b",
-                RegexOptions.IgnoreCase);
+            bool writesFile = s_fileWriteCmd.IsMatch(command);
             if (!writesFile)
             {
                 return false;
             }
 
-            bool sqlLike = Regex.IsMatch(
-                command,
-                @"\b(CREATE\s+TABLE|INSERT\s+INTO|ALTER\s+TABLE|DROP\s+TABLE|REFERENCES)\b",
-                RegexOptions.IgnoreCase);
+            bool sqlLike = s_sqlKeyword.IsMatch(command);
             if (!sqlLike)
             {
                 return false;
@@ -453,21 +500,13 @@ namespace SeeSharp.Models
                 return null;
             }
 
-            // PowerShell style: -Path "file.sql"
-            Match psPath = Regex.Match(
-                command,
-                @"-Path\s+(?<p>""[^""]+\.sql""|'[^']+\.sql'|[^\s;|&]+\.sql)",
-                RegexOptions.IgnoreCase);
+            Match psPath = s_psPathArg.Match(command);
             if (psPath.Success)
             {
                 return ResolveCommandPath(psPath.Groups["p"].Value, workingDirectory);
             }
 
-            // Redirection style: > file.sql or >> file.sql
-            Match redirPath = Regex.Match(
-                command,
-                @">>?\s*(?<p>""[^""]+\.sql""|'[^']+\.sql'|[^\s;|&]+\.sql)",
-                RegexOptions.IgnoreCase);
+            Match redirPath = s_redirPath.Match(command);
             if (redirPath.Success)
             {
                 return ResolveCommandPath(redirPath.Groups["p"].Value, workingDirectory);
@@ -497,10 +536,7 @@ namespace SeeSharp.Models
                 return false;
             }
 
-            Match composeMatch = Regex.Match(
-                command,
-                @"^\s*docker\s+compose\s+(?<sub>[a-zA-Z]+)\b(?<rest>.*)$",
-                RegexOptions.IgnoreCase);
+            Match composeMatch = s_composeCmd.Match(command);
             if (!composeMatch.Success)
             {
                 return false;
@@ -693,8 +729,7 @@ namespace SeeSharp.Models
 
         private static string? TryExtractLikelyComposeServiceToken(string command, string subCommand)
         {
-            // Tokenize while preserving simple quoted groups.
-            MatchCollection tokenMatches = Regex.Matches(command, @"(""[^""]*""|'[^']*'|\S+)");
+            MatchCollection tokenMatches = s_composeTokenize.Matches(command);
             List<string> tokens = tokenMatches.Select(m => m.Value).ToList();
             int composeIdx = tokens.FindIndex(t => t.Equals("compose", StringComparison.OrdinalIgnoreCase));
             if (composeIdx < 0 || composeIdx + 1 >= tokens.Count)
@@ -899,10 +934,7 @@ namespace SeeSharp.Models
             //   1> path
             //   2>> path
             // Stops at separators ; | & or line breaks.
-            MatchCollection matches = Regex.Matches(
-                command,
-                @"(?:^|[\s;])(?:\d)?>>?\s*(?<path>(?:""[^""]+""|'[^']+'|[^\s;|&]+))",
-                RegexOptions.Multiline);
+            MatchCollection matches = s_redirectTarget.Matches(command);
 
             foreach (Match match in matches)
             {
@@ -1091,7 +1123,7 @@ namespace SeeSharp.Models
                     return sb.ToString().Trim().TrimEnd('}', ')');
                 }
 
-                Match m = Regex.Match(valuePortion, @"^([^,}\r\n]+)");
+                Match m = s_lenientUnquoted.Match(valuePortion);
                 if (m.Success)
                 {
                     return m.Groups[1].Value.Trim().Trim('"', '\'');
@@ -1101,36 +1133,35 @@ namespace SeeSharp.Models
             return null;
         }
 
-        public Dictionary<string, object> ExecuteToolInvocation(string toolName, Dictionary<string, object?> args)
+        public async Task<Dictionary<string, object>> ExecuteToolInvocationAsync(string toolName, Dictionary<string, object?> args)
         {
 #pragma warning disable CS0618
             try
             {
-                // Tool names come from the model as strings; normalize so casing/whitespace mismatches still dispatch.
                 string key = (toolName ?? "").Trim().ToUpperInvariant();
                
                 switch (key)
                 {
-                    case var actualToolName when key == AgentDefaults.LIST_FILE_TOOL_NAME:
+                    case AgentDefaults.LIST_FILE_TOOL_NAME:
                         return ListFiles_Tool(
                             AgentUtilities.ResolveAbsPath(
                                 RequireArg(args, "directory", "path", "directoryPath")));
-                    case var actualToolName when key == AgentDefaults.READ_TOOL_NAME:
+                    case AgentDefaults.READ_TOOL_NAME:
                         return ReadFile_Tool(
                             AgentUtilities.ResolveAbsPath(
                                 RequireArg(args, "filename", "fileName")));
-                    case var actualToolName when key == AgentDefaults.EDIT_FILE_TOOL_NAME:
+                    case AgentDefaults.EDIT_FILE_TOOL_NAME:
                         return EditFile_Tool(
                             AgentUtilities.ResolveAbsPath(RequireArg(args, "path")),
                             OptionalArg(args, "oldContents", "old_str", "oldStr") ?? "",
                             OptionalArg(args, "newContents", "new_str", "newStr") ?? "");
-                    case var actualToolName when key == AgentDefaults.WEB_CALL_TOOL_NAME:
-                        return WebCall_Tool(
-                            RequireArg(args, "url"));
-                    case var actualToolName when key == AgentDefaults.BASH_TOOL_NAME:
-                        Dictionary<string, object> bashResult = Bash_Tool(
+                    case AgentDefaults.WEB_CALL_TOOL_NAME:
+                        return await WebCall_ToolAsync(
+                            RequireArg(args, "url")).ConfigureAwait(false);
+                    case AgentDefaults.BASH_TOOL_NAME:
+                        Dictionary<string, object> bashResult = await Bash_ToolAsync(
                             RequireArg(args, "command"),
-                            OptionalArg(args, "workingDirectory", "cwd", "directory"));
+                            OptionalArg(args, "workingDirectory", "cwd", "directory")).ConfigureAwait(false);
                         if (bashResult.TryGetValue("exit_code", out object? exitCodeObj) &&
                             int.TryParse(exitCodeObj?.ToString(), out int exitCode) &&
                             exitCode != 0 &&
@@ -1146,11 +1177,22 @@ namespace SeeSharp.Models
                         }
                         return bashResult;
 
+                    case AgentDefaults.CONFIG_EDIT_TOOL_NAME:
+                        return ConfigEdit_Tool(args);
+
                     default:
+                        // Check if it's a user-defined custom tool
+                        CustomToolDefinition? customTool = _config.CustomTools
+                            .FirstOrDefault(t => string.Equals(t.Name, key, StringComparison.OrdinalIgnoreCase));
+                        if (customTool is not null)
+                        {
+                            return await ExecuteCustomToolAsync(customTool, args).ConfigureAwait(false);
+                        }
+
                         return new Dictionary<string, object>
-                    {
-                        { "error", $"Unknown tool: {toolName}" }
-                    };
+                        {
+                            { "error", $"Unknown tool: {toolName}" }
+                        };
                 }
             }
 
@@ -1162,6 +1204,446 @@ namespace SeeSharp.Models
                 };
             }
 #pragma warning restore CS0618
+        }
+
+        private Dictionary<string, object> ConfigEdit_Tool(Dictionary<string, object?> args)
+        {
+            string action = (OptionalArg(args, "action") ?? "read").Trim().ToLowerInvariant();
+            string scope = (OptionalArg(args, "scope") ?? "workspace").Trim().ToLowerInvariant();
+            string configPath = (OptionalArg(args, "path") ?? "").Trim();
+            string? value = OptionalArg(args, "value");
+
+            if (_configEditCallsThisTask >= MaxConfigEditsPerTask && action != "read")
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", $"CONFIG_EDIT rate limit reached ({MaxConfigEditsPerTask} writes per task). Read is still allowed." }
+                };
+            }
+
+            string filePath = scope == "global"
+                ? SeeSharpConfigLoader.GetGlobalConfigPath()
+                : SeeSharpConfigLoader.GetWorkspaceConfigPath(AgentUtilities.ResolveWorkspaceRoot());
+
+            ThemedConsole.WriteLine(TerminalTone.Tool,
+                $"[Tool] CONFIG_EDIT {action} scope={scope} path=\"{configPath}\"");
+
+            if (action == "read")
+            {
+                return ConfigEdit_Read(filePath, configPath);
+            }
+
+            if (action == "set")
+            {
+                if (string.IsNullOrWhiteSpace(configPath))
+                {
+                    return new Dictionary<string, object>
+                    {
+                        { "error", "CONFIG_EDIT set requires a non-empty 'path' argument." }
+                    };
+                }
+
+                var result = ConfigEdit_Set(filePath, configPath, value);
+                if (!result.ContainsKey("error"))
+                    _configEditCallsThisTask++;
+                return result;
+            }
+
+            if (action == "remove")
+            {
+                if (string.IsNullOrWhiteSpace(configPath))
+                {
+                    return new Dictionary<string, object>
+                    {
+                        { "error", "CONFIG_EDIT remove requires a non-empty 'path' argument." }
+                    };
+                }
+
+                var result = ConfigEdit_Remove(filePath, configPath);
+                if (!result.ContainsKey("error"))
+                    _configEditCallsThisTask++;
+                return result;
+            }
+
+            return new Dictionary<string, object>
+            {
+                { "error", $"Unknown CONFIG_EDIT action: '{action}'. Use 'read', 'set', or 'remove'." }
+            };
+        }
+
+        private static Dictionary<string, object> ConfigEdit_Read(string filePath, string configPath)
+        {
+            if (!File.Exists(filePath))
+            {
+                return new Dictionary<string, object>
+                {
+                    { "config_path", filePath },
+                    { "exists", false },
+                    { "content", "{}" }
+                };
+            }
+
+            try
+            {
+                string json = File.ReadAllText(filePath);
+                if (string.IsNullOrWhiteSpace(configPath))
+                {
+                    return new Dictionary<string, object>
+                    {
+                        { "config_path", filePath },
+                        { "exists", true },
+                        { "content", json.Length > 4000 ? json[..4000] + "\n[...truncated...]" : json }
+                    };
+                }
+
+                using JsonDocument doc = JsonDocument.Parse(json, new JsonDocumentOptions
+                {
+                    CommentHandling = JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true
+                });
+                JsonElement current = doc.RootElement;
+                foreach (string segment in configPath.Split('.'))
+                {
+                    if (current.ValueKind != JsonValueKind.Object ||
+                        !current.TryGetProperty(segment, out JsonElement next))
+                    {
+                        return new Dictionary<string, object>
+                        {
+                            { "config_path", filePath },
+                            { "json_path", configPath },
+                            { "value", "(not found)" }
+                        };
+                    }
+                    current = next;
+                }
+
+                return new Dictionary<string, object>
+                {
+                    { "config_path", filePath },
+                    { "json_path", configPath },
+                    { "value", current.ToString() ?? "" }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", $"Failed to read config: {ex.Message}" }
+                };
+            }
+        }
+
+        private static Dictionary<string, object> ConfigEdit_Set(string filePath, string configPath, string? value)
+        {
+            try
+            {
+                // Ensure directory exists for global config
+                string? dir = Path.GetDirectoryName(filePath);
+                if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
+                Dictionary<string, JsonElement>? root;
+                if (File.Exists(filePath))
+                {
+                    string existing = File.ReadAllText(filePath);
+                    root = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(existing, new JsonSerializerOptions
+                    {
+                        ReadCommentHandling = JsonCommentHandling.Skip,
+                        AllowTrailingCommas = true
+                    });
+                }
+                else
+                {
+                    root = new Dictionary<string, JsonElement>();
+                }
+
+                root ??= new Dictionary<string, JsonElement>();
+
+                // Rebuild as mutable JSON via round-trip through raw text manipulation.
+                string currentJson = JsonSerializer.Serialize(root, new JsonSerializerOptions { WriteIndented = true });
+                using JsonDocument doc = JsonDocument.Parse(currentJson);
+                var mutable = JsonSerializer.Deserialize<Dictionary<string, object?>>(currentJson, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                }) ?? new();
+
+                // Set value at path using simple dot-path logic for top-level and one-deep properties
+                string[] segments = configPath.Split('.');
+                JsonElement parsedValue = ParseConfigValue(value);
+
+                if (segments.Length == 1)
+                {
+                    mutable[segments[0]] = parsedValue;
+                }
+                else if (segments.Length == 2)
+                {
+                    if (!mutable.ContainsKey(segments[0]) || mutable[segments[0]] is null)
+                    {
+                        mutable[segments[0]] = JsonSerializer.Deserialize<JsonElement>(
+                            $"{{\"{segments[1]}\": {parsedValue.GetRawText()}}}");
+                    }
+                    else
+                    {
+                        string parentJson = JsonSerializer.Serialize(mutable[segments[0]]);
+                        var parent = JsonSerializer.Deserialize<Dictionary<string, object?>>(parentJson) ?? new();
+                        parent[segments[1]] = parsedValue;
+                        mutable[segments[0]] = JsonSerializer.Deserialize<JsonElement>(
+                            JsonSerializer.Serialize(parent));
+                    }
+                }
+                else
+                {
+                    return new Dictionary<string, object>
+                    {
+                        { "error", "CONFIG_EDIT supports paths up to 2 levels deep (e.g. 'limits.bashCommandTimeoutSeconds')." }
+                    };
+                }
+
+                string outputJson = JsonSerializer.Serialize(mutable, new JsonSerializerOptions { WriteIndented = true });
+                string tempPath = filePath + ".tmp";
+                File.WriteAllText(tempPath, outputJson);
+                File.Move(tempPath, filePath, overwrite: true);
+
+                ThemedConsole.WriteLine(TerminalTone.Tool,
+                    $"[Tool] CONFIG_EDIT: set {configPath} = {parsedValue.GetRawText()} in {filePath}");
+
+                return new Dictionary<string, object>
+                {
+                    { "config_path", filePath },
+                    { "action", "set" },
+                    { "json_path", configPath },
+                    { "new_value", parsedValue.ToString() ?? "" },
+                    { "ok", true }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", $"CONFIG_EDIT set failed: {ex.Message}" }
+                };
+            }
+        }
+
+        private static Dictionary<string, object> ConfigEdit_Remove(string filePath, string configPath)
+        {
+            if (!File.Exists(filePath))
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", $"Config file does not exist: {filePath}" }
+                };
+            }
+
+            try
+            {
+                string json = File.ReadAllText(filePath);
+                var mutable = JsonSerializer.Deserialize<Dictionary<string, object?>>(json, new JsonSerializerOptions
+                {
+                    ReadCommentHandling = JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true
+                }) ?? new();
+
+                string[] segments = configPath.Split('.');
+                bool removed = false;
+
+                if (segments.Length == 1)
+                {
+                    removed = mutable.Remove(segments[0]);
+                }
+                else if (segments.Length == 2 && mutable.ContainsKey(segments[0]) && mutable[segments[0]] is not null)
+                {
+                    string parentJson = JsonSerializer.Serialize(mutable[segments[0]]);
+                    var parent = JsonSerializer.Deserialize<Dictionary<string, object?>>(parentJson) ?? new();
+                    removed = parent.Remove(segments[1]);
+                    mutable[segments[0]] = JsonSerializer.Deserialize<JsonElement>(
+                        JsonSerializer.Serialize(parent));
+                }
+
+                if (!removed)
+                {
+                    return new Dictionary<string, object>
+                    {
+                        { "config_path", filePath },
+                        { "json_path", configPath },
+                        { "ok", false },
+                        { "reason", "Key not found at path." }
+                    };
+                }
+
+                string outputJson = JsonSerializer.Serialize(mutable, new JsonSerializerOptions { WriteIndented = true });
+                string tempPath = filePath + ".tmp";
+                File.WriteAllText(tempPath, outputJson);
+                File.Move(tempPath, filePath, overwrite: true);
+
+                return new Dictionary<string, object>
+                {
+                    { "config_path", filePath },
+                    { "action", "remove" },
+                    { "json_path", configPath },
+                    { "ok", true }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", $"CONFIG_EDIT remove failed: {ex.Message}" }
+                };
+            }
+        }
+
+        private static JsonElement ParseConfigValue(string? value)
+        {
+            if (value is null)
+                return JsonSerializer.Deserialize<JsonElement>("null");
+
+            // Try parsing as raw JSON first (number, boolean, array, object)
+            try
+            {
+                return JsonSerializer.Deserialize<JsonElement>(value);
+            }
+            catch
+            {
+                // Fall back to treating it as a string literal
+                return JsonSerializer.Deserialize<JsonElement>($"\"{value.Replace("\\", "\\\\").Replace("\"", "\\\"")}\"");
+            }
+        }
+
+        private async Task<Dictionary<string, object>> ExecuteCustomToolAsync(
+            CustomToolDefinition tool, Dictionary<string, object?> args)
+        {
+            string type = (tool.Type ?? "bash").Trim().ToLowerInvariant();
+            switch (type)
+            {
+                case "bash":
+                    return await ExecuteCustomBashToolAsync(tool, args).ConfigureAwait(false);
+                case "http":
+                    return await ExecuteCustomHttpToolAsync(tool, args).ConfigureAwait(false);
+                default:
+                    return new Dictionary<string, object>
+                    {
+                        { "error", $"Unknown custom tool type: '{tool.Type}'. Supported: bash, http." }
+                    };
+            }
+        }
+
+        private async Task<Dictionary<string, object>> ExecuteCustomBashToolAsync(
+            CustomToolDefinition tool, Dictionary<string, object?> args)
+        {
+            string command = tool.Command ?? "";
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", $"Custom tool '{tool.Name}' has no command template." }
+                };
+            }
+
+            // Interpolate parameters from args into the command template
+            if (tool.Parameters is { Count: > 0 })
+            {
+                foreach (string param in tool.Parameters)
+                {
+                    string? paramValue = OptionalArg(args, param);
+                    if (paramValue is null)
+                    {
+                        return new Dictionary<string, object>
+                        {
+                            { "error", $"Custom tool '{tool.Name}' requires parameter '{param}' which was not provided." }
+                        };
+                    }
+                    command = command.Replace($"{{{{{param}}}}}", paramValue);
+                }
+            }
+
+            ThemedConsole.WriteLine(TerminalTone.Tool,
+                $"[Tool] Custom({tool.Name}): {command}");
+
+            return await Bash_ToolAsync(command, tool.WorkingDirectory).ConfigureAwait(false);
+        }
+
+        private static async Task<Dictionary<string, object>> ExecuteCustomHttpToolAsync(
+            CustomToolDefinition tool, Dictionary<string, object?> args)
+        {
+            string url = tool.Url ?? "";
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", $"Custom tool '{tool.Name}' has no URL template." }
+                };
+            }
+
+            string method = (tool.Method ?? "GET").Trim().ToUpperInvariant();
+            string? body = tool.Body;
+
+            // Interpolate parameters
+            if (tool.Parameters is { Count: > 0 } && args is not null)
+            {
+                foreach (string param in tool.Parameters)
+                {
+                    string? paramValue = null;
+                    if (args.TryGetValue(param, out object? v) && v is not null)
+                    {
+                        paramValue = v is JsonElement je
+                            ? (je.ValueKind == JsonValueKind.String ? je.GetString() : je.ToString())
+                            : v.ToString();
+                    }
+
+                    if (paramValue is not null)
+                    {
+                        url = url.Replace($"{{{{{param}}}}}", paramValue);
+                        body = body?.Replace($"{{{{{param}}}}}", paramValue);
+                    }
+                }
+            }
+
+            try
+            {
+                if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri))
+                {
+                    return new Dictionary<string, object>
+                    {
+                        { "error", $"Custom tool '{tool.Name}': invalid URL after interpolation: {url}" }
+                    };
+                }
+
+                int timeoutSec = tool.TimeoutSeconds ?? 20;
+                using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(timeoutSec) };
+                HttpResponseMessage response;
+
+                if (method == "POST" && body is not null)
+                {
+                    var content = new System.Net.Http.StringContent(body, Encoding.UTF8, "application/json");
+                    response = await http.PostAsync(uri, content).ConfigureAwait(false);
+                }
+                else
+                {
+                    response = await http.GetAsync(uri).ConfigureAwait(false);
+                }
+
+                string responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                if (responseBody.Length > 25_000)
+                    responseBody = responseBody[..25_000] + "\n[...truncated...]";
+
+                return new Dictionary<string, object>
+                {
+                    { "tool", tool.Name },
+                    { "url", url },
+                    { "method", method },
+                    { "status_code", (int)response.StatusCode },
+                    { "body", responseBody },
+                    { "ok", response.IsSuccessStatusCode }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", $"Custom tool '{tool.Name}' HTTP request failed: {ex.Message}" }
+                };
+            }
         }
         private string RequireArg(Dictionary<string, object?> args, params string[] keys)
         {

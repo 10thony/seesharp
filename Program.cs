@@ -30,7 +30,20 @@ if (TryRelaunchUnderDotnetWatch(args))
     return;
 }
 
-const string lmStudioBaseUri = "http://cobec-spark:1234/v1";
+// Load layered config (global + workspace) early so all downstream consumers see it.
+string configWorkspaceRoot = AgentUtilities.ResolveWorkspaceRoot();
+ResolvedConfig resolvedConfig = SeeSharpConfigLoader.Load(configWorkspaceRoot);
+AgentDefaults.ActiveConfig = resolvedConfig;
+
+// Generate starter config on first run if no workspace config exists.
+if (SeeSharpConfigLoader.GenerateStarterConfig(configWorkspaceRoot))
+{
+    ThemedConsole.WriteLine(TerminalTone.Reasoning,
+        $"[Config] Generated starter config: {Path.Combine(configWorkspaceRoot, SeeSharpConfigLoader.WorkspaceConfigFileName)}");
+}
+
+string lmStudioBaseUri = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URI")
+    ?? "http://cobec-spark:1234/v1";
 
 // LM Studio often ignores this; the SDK still requires a credential value.
 string apiKey = Environment.GetEnvironmentVariable("LMSTUDIO_API_KEY") ?? "lm-studio";
@@ -45,6 +58,7 @@ var lmStudioResponsesClient = new ResponsesClient(credential, clientOptions);
 
 string contextualizerModelId = Environment.
     GetEnvironmentVariable("SEESHARP_CONTEXTUALIZER_MODEL")
+    ?? resolvedConfig.ContextualizerPreferredModel
     ?? Agent.DefaultContextualizerModelId;
 var contextualizerChatClient = new ChatClient(
     contextualizerModelId, credential, clientOptions);
@@ -52,6 +66,12 @@ var contextualizerChatClient = new ChatClient(
 StringBuilder availableModelsSB = new StringBuilder();
 availableModelsSB.AppendLine("LM Studio — select a loaded model:");
 
+
+// Session recording: write all session data to JSONL for fine-tuning.
+string sessionOutputDir = Path.Combine(configWorkspaceRoot, "datasets", "sessions");
+SessionRecorder sessionRecorder = new SessionRecorder(sessionOutputDir);
+ThemedConsole.WriteLine(TerminalTone.Reasoning,
+    $"[Session] Recording to: {sessionRecorder.OutputPath}");
 
 using var cts = new CancellationTokenSource();
 List<OpenAIModel> models = (await lmStudioModelsClient
@@ -68,13 +88,33 @@ void MarkModelActive(string modelId)
 MarkModelActive(contextualizerModelId);
 
 int[] unloadOnceGate = [0];
+int[] sessionEndGate = [0];
 Action unloadLoadedModelsOnExit = CreateUnloadLoadedModelsAction(
     () => activeModelIds,
     lmStudioBaseUri,
     apiKey,
     unloadOnceGate);
-AppDomain.CurrentDomain.ProcessExit += (_, _) => unloadLoadedModelsOnExit();
-Console.CancelKeyPress += (_, _) => unloadLoadedModelsOnExit();
+Action finalizeSessionOnExit = () =>
+{
+    if (Interlocked.Exchange(ref sessionEndGate[0], 1) != 0)
+        return;
+    try
+    {
+        sessionRecorder.RecordSessionEnd("process_exit");
+        sessionRecorder.Dispose();
+    }
+    catch { }
+};
+AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+{
+    finalizeSessionOnExit();
+    unloadLoadedModelsOnExit();
+};
+Console.CancelKeyPress += (_, _) =>
+{
+    finalizeSessionOnExit();
+    unloadLoadedModelsOnExit();
+};
 
 try
 {
@@ -88,47 +128,27 @@ try
             contextualizerModelId,
             (keepOnlyIds, token) => KeepOnlyModelsLoadedAsync(models, keepOnlyIds, lmStudioBaseUri, apiKey, token),
             MarkModelActive,
+            sessionRecorder,
             cts.Token);
         return;
     }
 
-    List<string> questions = new List<string>()
-    {
-        //"Read the Program.cs file and tell me what it does.",
-        //"Edit the Agent.cs file so it is a regular class instead of an abstract class.",
-        //"what does cobec inc do? here is there homepage: https://www.cobec.com/",
-        //"List the files in the codebase, study what there is, determine the most important files to read," +
-        //" and tell me what this app does.",
-        //"How can i build this program?",
-        //"Study this codebase and let me know what it does."
-        //"List the files in the codebase, study what there is, determine the most important files to read," +
-        //" and tell me what this app does.",
-        //"How can i build this program?",
-        //"Study this codebase and let me know what it does."
+    List<string> questions =
+    [
         "Turn on the postgres docker container named testpostgres",
-        "Create a SQL file to create a user table with columns for ID" +
-            " (auto generated and incrementing Primary Key), name, role_id," +
-            "labor_category_code, ",
-        "Create a SQL script that creates an item with columns for, ID " +
-            "(auto generated and incrementing primary key)" +
-            "name, description, cost, manufacturer, location, owner (user id foreign key)," +
-            " status (item status lookup value)",
-        "Create a SQL script that creates an item status lookup table with values for" +
-            " active, inactive, and archived",
-        "Create a SQL script that creates a role lookup table with values for admin, user",
-        "Create a SQL script that creates a labor category lookup table with values for " +
-            "full time, part time, contractor,",
-        "Create a SQL Script that loads our postgres container with entities for the tables it contains.",
+        "Create a SQL file to create a user table with columns for ID (auto generated and incrementing Primary Key), name, role_id, labor_category_code",
+    ];
 
-    };
-
-    LMStudioToolKit toolKit = new LMStudioToolKit();
+    ToolKit toolKit = new ToolKit(resolvedConfig);
 
     foreach (OpenAIModel model in models)
     {
         MarkModelActive(model.Id);
-        LMStudioAgent agent = new(model, toolKit, contextualizerChatClient);
-
+        Agent agent = new(model, toolKit, contextualizerChatClient, resolvedConfig)
+        {
+            SessionRecorder = sessionRecorder
+        };
+        sessionRecorder.RecordSessionStart(model.Id, configWorkspaceRoot, contextualizerModelId);
 
         StringBuilder agentLoopStrings = await
                agent.AgentLoop(new ResponsesClient(credential, clientOptions),
@@ -138,6 +158,11 @@ try
 }
 finally
 {
+    if (Interlocked.Exchange(ref sessionEndGate[0], 1) == 0)
+    {
+        sessionRecorder.RecordSessionEnd("normal");
+        sessionRecorder.Dispose();
+    }
     unloadLoadedModelsOnExit();
 }
 
@@ -309,34 +334,6 @@ static string QuoteArg(string arg)
     return "\"" + arg.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
 }
 
-static OpenAIModel PromptUserToSelectModel(string userInput, List<OpenAIModel> models)
-{
-    bool isUserInputValid =
-        int.TryParse(userInput, out int selectedModelIndex) &&
-        selectedModelIndex >= 0 &&
-        selectedModelIndex < models.Count;
-
-    if (isUserInputValid)
-    {
-        return models[selectedModelIndex];
-    }
-
-    while (!isUserInputValid)
-    {
-        ThemedConsole.WriteLine(TerminalTone.Error,
-            "Invalid input. Please enter a valid number corresponding to the " +
-            "model you want to select:");
-        ThemedConsole.ApplyTone(TerminalTone.User);
-        userInput = Console.ReadLine() ?? "";
-        ThemedConsole.Reset();
-        isUserInputValid = int.TryParse(userInput, out selectedModelIndex) &&
-            selectedModelIndex >= 0 &&
-            selectedModelIndex < models.Count;
-    }
-
-    return models[selectedModelIndex];
-}
-
 static Action CreateUnloadLoadedModelsAction(
     Func<IEnumerable<string>> modelIdsProvider,
     string lmStudioBaseUri,
@@ -471,10 +468,3 @@ static async Task KeepOnlyModelsLoadedAsync(
 }
 #endregion
 
-#region app-local result type
-sealed class CreateResponseResult
-{
-    public required string ResponseId { get; init; }
-    public required string ResponseContentText { get; init; }
-}
-#endregion

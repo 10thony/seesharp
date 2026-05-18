@@ -6,7 +6,6 @@ using System.ClientModel;
 using System.ClientModel.Primitives;
 using System.Collections.Generic;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -15,52 +14,84 @@ using System.Threading;
 namespace SeeSharp.Models
 {
 
-    public class LMStudioAgent(
-        OpenAIModel model,
-        ToolKit toolRegistry,
-        ChatClient contextualizerChatClient)
-        : Agent(model, toolRegistry, contextualizerChatClient)
-    {
-    }
-
     /// <summary>
-    /// Our base openai compliant Agent class
-    /// this will have built in responses / chat completions functionality that is openai compliant
-    /// this is so that the agent can be later wrapped to support different standards.
-    /// 
-    /// each method represents an action that our agents are expected to support.
-    /// e.g. 
+    /// OpenAI-compatible agent with a tool loop, contextualizer pipeline, and task-completion
+    /// heuristics. Talks to LM Studio (or any /v1-compatible server) via the OpenAI .NET SDK.
     /// </summary>
-    public abstract class Agent
+    public partial class Agent
     {
         public const string DefaultContextualizerModelId = "qwen/qwen3.5-2b";
-        public const string DefaultToolInvocationHandlerModel = "qwen/qwen3.5-4b";
-        // Local models often need many one-tool turns (read → locate → read → edit → verify).
-        private const int MaxAgentTurnsPerTask = 28;
-        /// <summary>Caps how many tool lines we execute from a single assistant message (prevents parallel spam).</summary>
-        private const int MaxToolCallsPerTurn = 2;
-        /// <summary>Hard cap on successful (non-skipped) tool executions per user task.</summary>
-        private const int MaxSuccessfulToolExecutionsPerTask = 22;
-        private const int MaxResponseRetries = 3;
+        private readonly ResolvedConfig _config;
+        private static readonly Regex s_whitespace = new(@"\s+", RegexOptions.Compiled);
+        private static readonly Regex s_gciRecurseFilter = new(
+            @"\bget-childitem\b.*\b-recurse\b.*(\b-filter\b|\b-include\b).*\*\.cs",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_gciRecurseFile = new(
+            @"\bget-childitem\b.*\b-recurse\b.*\b-file\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_selectStringCs = new(
+            @"\bselect-string\b.*(\*\*/\*\.cs|'\*\*/\*\.cs'|""\*\*/\*\.cs"")",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_findNameCs = new(
+            @"\bfind\b\s+\.\s+-name\s+[""']?\*\.cs[""']?",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_serviceAction = new(
+            @"\b(docker\s+compose|docker\s+container|docker\s+service|kubectl|systemctl|service)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_serviceActionVerb = new(
+            @"\b(up|start|stop|restart|down|exec)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_pgIsReady = new(
+            @"\bpg_isready\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_serviceStatusVerb = new(
+            @"\b(ps|status|logs|inspect|get|describe|health|ready)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_fileWriteCmd = new(
+            @"(>\s*\S+|>>\s*\S+|\b(Set-Content|Add-Content|Out-File|New-Item\s+-ItemType\s+File|tee|touch|cp|mv)\b)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex s_fileReadCmd = new(
+            @"\b(Get-Content|cat|type|less|more|head|tail|ls|dir|Get-ChildItem|Test-Path|stat)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        // Fallback constants — overridden by ResolvedConfig when available.
+        private const int FallbackMaxAgentTurnsPerTask = 28;
+        private const int FallbackMaxToolCallsPerTurn = 2;
+        private const int FallbackMaxSuccessfulToolExecutionsPerTask = 22;
+        private const int FallbackMaxResponseRetries = 3;
+        private const int FallbackMaxNoProgressTurns = 3;
         private const int MaxCompletionValidationRetries = 2;
         private const int MaxSerializedToolOutputChars = 12_000;
         private const int MaxToolStringValueChars = 4_000;
-        private const int MaxNoProgressTurns = 3;
         private const int MaxContextResetAttemptsPerTask = 3;
         private const bool ShowPerTickModelWaitLogs = false;
         private const bool StreamMainModelOutputByDefault = true;
 
+        private int MaxAgentTurnsPerTask => _config.MaxAgentTurnsPerTask;
+        private int MaxToolCallsPerTurn => _config.MaxToolCallsPerTurn;
+        private int MaxSuccessfulToolExecutionsPerTask => _config.MaxSuccessfulToolExecutionsPerTask;
+        private int MaxResponseRetries => _config.MaxResponseRetries;
+        private int MaxNoProgressTurns => _config.MaxNoProgressTurns;
+
         public OpenAIModel Model { get; set; }
         private ToolKit ToolKit { get; set;  }
         private readonly ChatClient? _contextualizerChatClient;
+        private SessionRecorder? _sessionRecorder;
+
+        public SessionRecorder? SessionRecorder
+        {
+            get => _sessionRecorder;
+            set => _sessionRecorder = value;
+        }
         
         public Agent(OpenAIModel model,
                      ToolKit toolRegistry,
-                     ChatClient? contextualizerChatClient = null)
+                     ChatClient? contextualizerChatClient = null,
+                     ResolvedConfig? config = null)
         {
             this.Model = model;
             this.ToolKit = toolRegistry;
             _contextualizerChatClient = contextualizerChatClient;
+            _config = config ?? AgentDefaults.ActiveConfig ?? new ResolvedConfig();
         }
 
         public async Task<StringBuilder> AgentLoop(
@@ -100,13 +131,23 @@ namespace SeeSharp.Models
                     "See preceding [Contextualizer] debug lines (empty model output, bad JSON paths, or no file summaries).");
             }
 
+            if (!string.IsNullOrWhiteSpace(repoContext))
+            {
+                _sessionRecorder?.RecordRepoContext(repoContext);
+            }
+
             sb.AppendLine($"[Contextualizer] {repoContext}");
 
             ThemedConsole.WriteLine(TerminalTone.Reasoning, $"[Contextualizer] {repoContext}");
 
 
+            _sessionRecorder?.RecordSystemPrompt(GenerateSystemPrompt());
+
+            int taskIndex = 0;
             foreach (string task in tasks)
             {
+                ToolKit.ResetTaskState();
+
                 if (task.Contains("exit", StringComparison.OrdinalIgnoreCase))
                 {
                     ThemedConsole.WriteLine(TerminalTone.Default, "Exiting the program. Goodbye!");
@@ -120,6 +161,8 @@ namespace SeeSharp.Models
                     break;
                 }
 
+                _sessionRecorder?.RecordUserTask(task, taskIndex);
+
                 ThemedConsole.WriteLine(TerminalTone.User, $"You: {task}");
                 sb.AppendLine($"You: {task}");
 
@@ -127,6 +170,7 @@ namespace SeeSharp.Models
                     lmStudioResponsesClient,
                     task,
                     repoContext,
+                    taskIndex,
                     cancellationToken).ConfigureAwait(false);
 
                 if (!string.IsNullOrWhiteSpace(finalAnswer))
@@ -134,6 +178,7 @@ namespace SeeSharp.Models
                     ThemedConsole.WriteLine(TerminalTone.Agent, $" {finalAnswer}");
                 }
 
+                taskIndex++;
             }
 
             return sb;
@@ -143,10 +188,14 @@ namespace SeeSharp.Models
             ResponsesClient responsesClient,
             string task,
             string repoContext,
+            int taskIndex,
             CancellationToken cancellationToken)
         {
-            static Task<string> CompleteAndReturnAsync(string finalText, string _status) =>
-                Task.FromResult(finalText);
+            Task<string> CompleteAndReturnAsync(string finalText, string status)
+            {
+                _sessionRecorder?.RecordTaskOutcome(task, taskIndex, status, finalText);
+                return Task.FromResult(finalText);
+            }
 
             string currentInput = task;
             string lastAssistantText = "";
@@ -224,40 +273,14 @@ namespace SeeSharp.Models
                 }
                 lastAssistantText = assistantText;
 
-                List<(string toolName, Dictionary<string, object?> args)> invocations;
-                try
-                {
-                    invocations = await ParseToolInvocationsWithSmallModelAsync(
-                        responsesClient,
-                        task,
-                        repoContext,
-                        assistantText,
-                        cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    if (cancellationToken.IsCancellationRequested)
-                    {
-                        throw;
-                    }
+                _sessionRecorder?.RecordAssistantResponse(assistantText, turn + 1, assistantResponse.ResponseId);
 
-                    ThemedConsole.WriteLine(
-                        TerminalTone.Error,
-                        "[Agent] Tool-call parser model request timed out.");
-                    return await CompleteAndReturnAsync(
-                        "Stopped: the tool parser did not respond within the per-request time limit.",
-                        "timed_out").ConfigureAwait(false);
-                }
+                List<(string toolName, Dictionary<string, object?> args)> invocations =
+                    ExtractToolInvocations(ToolKit, assistantText);
 
                 if (invocations.Count == 0)
                 {
-                    TaskCompletionAssessment assessment = await AssessTaskCompletionAsync(
-                        responsesClient,
-                        task,
-                        assistantText,
-                        cumulativeToolOutputs,
-                        repoContext,
-                        cancellationToken).ConfigureAwait(false);
+                    TaskCompletionAssessment assessment = AssessTaskCompletion(cumulativeToolOutputs);
 
                     if (assessment.IsComplete)
                     {
@@ -289,25 +312,43 @@ namespace SeeSharp.Models
                 }
 
                 invocations = invocations.Take(MaxToolCallsPerTurn).ToList();
-                List<ToolExecutionEnvelope> toolOutputs = new List<ToolExecutionEnvelope>(invocations.Count);
-                foreach (var (toolName, args) in invocations)
+
+                _sessionRecorder?.RecordToolCalls(invocations, turn + 1);
+
+                // Pre-check duplicates synchronously, then run non-duplicate tools concurrently.
+                var pendingWork = new List<(int idx, string toolName, Dictionary<string, object?> args, Task<Dictionary<string, object>>? execTask, Dictionary<string, object>? immediateResult)>(invocations.Count);
+                for (int i = 0; i < invocations.Count; i++)
                 {
+                    var (toolName, args) = invocations[i];
                     string signature = BuildToolInvocationSignature(toolName, args);
-                    Dictionary<string, object> toolResult;
                     if (!seenToolSignatures.Add(signature))
                     {
-                        toolResult = new Dictionary<string, object>
+                        var skipResult = new Dictionary<string, object>
                         {
                             { "skipped", true },
                             { "reason", "Duplicate tool call skipped for this task to prevent loops." },
                             { "tool_signature", signature }
                         };
+                        pendingWork.Add((i, toolName, args, null, skipResult));
                     }
                     else
                     {
-                        toolResult = ToolKit.ExecuteToolInvocation(toolName, args);
+                        var execTask = ToolKit.ExecuteToolInvocationAsync(toolName, args);
+                        pendingWork.Add((i, toolName, args, execTask, null));
                     }
+                }
 
+                var activeTasks = pendingWork
+                    .Where(p => p.execTask is not null)
+                    .Select(p => p.execTask!)
+                    .ToArray();
+                if (activeTasks.Length > 0)
+                    await Task.WhenAll(activeTasks).ConfigureAwait(false);
+
+                List<ToolExecutionEnvelope> toolOutputs = new(invocations.Count);
+                foreach (var (idx, toolName, args, execTask, immediateResult) in pendingWork)
+                {
+                    Dictionary<string, object> toolResult = immediateResult ?? await execTask!.ConfigureAwait(false);
                     toolResult = SanitizeToolResult(toolResult);
                     toolOutputs.Add(new ToolExecutionEnvelope
                     {
@@ -317,6 +358,21 @@ namespace SeeSharp.Models
                     });
                 }
                 cumulativeToolOutputs.AddRange(toolOutputs);
+
+                if (_sessionRecorder is not null)
+                {
+                    var records = new List<ToolExecutionRecord>(toolOutputs.Count);
+                    foreach (var output in toolOutputs)
+                    {
+                        records.Add(new ToolExecutionRecord
+                        {
+                            ToolName = output.ToolName,
+                            Arguments = output.Args,
+                            Result = output.Result
+                        });
+                    }
+                    _sessionRecorder.RecordToolResults(records, turn + 1);
+                }
 
                 successfulToolExecutions += CountSuccessfulToolExecutions(toolOutputs);
                 if (successfulToolExecutions > MaxSuccessfulToolExecutionsPerTask)
@@ -375,6 +431,8 @@ namespace SeeSharp.Models
                     allSkippedThisTurn,
                     seenToolsBridgeHint: BuildSeenToolsBridgeHint(seenToolSignatures),
                     cancellationToken).ConfigureAwait(false);
+
+                _sessionRecorder?.RecordTurnBridge(currentInput, turn + 1);
             }
 
             return await CompleteAndReturnAsync(
@@ -523,12 +581,12 @@ namespace SeeSharp.Models
                 return "";
             }
 
-            string normalized = Regex.Replace(command.Trim(), @"\s+", " ").ToLowerInvariant();
+            string normalized = s_whitespace.Replace(command.Trim(), " ").ToLowerInvariant();
             bool isRepoWideCsEnumeration =
-                Regex.IsMatch(normalized, @"\bget-childitem\b.*\b-recurse\b.*(\b-filter\b|\b-include\b).*\*\.cs") ||
-                Regex.IsMatch(normalized, @"\bget-childitem\b.*\b-recurse\b.*\b-file\b") ||
-                Regex.IsMatch(normalized, @"\bselect-string\b.*(\*\*/\*\.cs|'\*\*/\*\.cs'|""\*\*/\*\.cs"")") ||
-                Regex.IsMatch(normalized, @"\bfind\b\s+\.\s+-name\s+[""']?\*\.cs[""']?");
+                s_gciRecurseFilter.IsMatch(normalized) ||
+                s_gciRecurseFile.IsMatch(normalized) ||
+                s_selectStringCs.IsMatch(normalized) ||
+                s_findNameCs.IsMatch(normalized);
 
             if (isRepoWideCsEnumeration)
             {
@@ -610,226 +668,39 @@ namespace SeeSharp.Models
         }
 
         /// <summary>
-        /// Stable, compact fingerprint of tool output so distinct successful runs do not look "stuck".
+        /// Lightweight fingerprint (length + head/tail samples) instead of SHA256 for progress detection.
         /// </summary>
         private static string FingerprintSuccessfulToolResult(Dictionary<string, object> result)
         {
-            IEnumerable<string> keys = result.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase);
-            StringBuilder canonical = new StringBuilder();
-            foreach (string key in keys)
+            int totalLen = 0;
+            StringBuilder sample = new(256);
+            foreach (string key in result.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase))
             {
                 if (!result.TryGetValue(key, out object? val) || val is null)
-                {
                     continue;
-                }
-
                 string s = val.ToString() ?? "";
-                if (s.Length > 4096)
-                {
-                    s = s[..4096] + $"\n[truncated; totalChars={val.ToString()!.Length}]";
-                }
-
-                canonical.Append(key).Append('=').Append(s).Append('\n');
+                totalLen += s.Length;
+                int head = Math.Min(100, s.Length);
+                int tail = Math.Min(100, Math.Max(0, s.Length - head));
+                sample.Append(key).Append(':').Append(s.Length).Append(':');
+                sample.Append(s.AsSpan(0, head));
+                if (tail > 0)
+                    sample.Append(s.AsSpan(s.Length - tail));
+                sample.Append('|');
             }
-
-            byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString()));
-            return Convert.ToHexString(hash.AsSpan(0, 8));
+            return $"{totalLen}:{sample}";
         }
 
-        private async Task<List<(string toolName, Dictionary<string, object?> args)>> ParseToolInvocationsWithSmallModelAsync(
-            ResponsesClient responsesClient,
-            string task,
-            string repoContext,
-            string assistantText,
-            CancellationToken cancellationToken)
+        /// <summary>
+        /// Deterministic tool-call extraction from assistant text. The system prompt enforces
+        /// the <c>tool: NAME({...})</c> format, so we no longer need a second LLM call to
+        /// parse tool invocations -- saving ~33% of per-turn LLM calls.
+        /// </summary>
+        private static List<(string toolName, Dictionary<string, object?> args)> ExtractToolInvocations(
+            ToolKit toolKit,
+            string assistantText)
         {
-            // Source of truth: explicit `tool:` lines from assistant output.
-            List<(string toolName, Dictionary<string, object?> args)> deterministicCalls =
-                ToolKit.ExtractToolCallInvocations(assistantText);
-            if (deterministicCalls.Count > 0)
-            {
-                return deterministicCalls;
-            }
-
-            StringBuilder parserPrompt = new StringBuilder();
-            parserPrompt.AppendLine("You are a tool-call parser.");
-            parserPrompt.AppendLine("Extract tool calls from the assistant text.");
-            parserPrompt.AppendLine("Return ONLY JSON in this schema:");
-            parserPrompt.AppendLine("{\"calls\":[{\"toolName\":\"NAME\",\"args\":{}}]}");
-            parserPrompt.AppendLine("If no tool call is present return: {\"calls\":[]}");
-            parserPrompt.AppendLine("Allowed tool names:");
-            parserPrompt.AppendLine(AgentDefaults.BASH_TOOL_NAME);
-            parserPrompt.AppendLine(AgentDefaults.WEB_CALL_TOOL_NAME);
-            parserPrompt.AppendLine(AgentDefaults.READ_TOOL_NAME);
-            parserPrompt.AppendLine(AgentDefaults.LIST_FILE_TOOL_NAME);
-            parserPrompt.AppendLine(AgentDefaults.EDIT_FILE_TOOL_NAME);
-            parserPrompt.AppendLine();
-            parserPrompt.AppendLine("Assistant text:");
-            parserPrompt.AppendLine(assistantText);
-
-            CreateResponseResult parsed = await WithPerCallTimeoutAndTelemetryAsync(
-                "[Agent] tool-call parser",
-                TerminalTone.Reasoning,
-                AgentDefaults.ResponsesApiCallTimeout,
-                ct => CreateResponseWithRetryAsync(
-                    modelId: DefaultToolInvocationHandlerModel,
-                    input: parserPrompt.ToString(),
-                    lmStudioResponsesClient: responsesClient,
-                    repoContext: repoContext,
-                    compactPrompt: false,
-                    streamOutput: false,
-                    cancellation: ct),
-                cancellationToken).ConfigureAwait(false);
-
-            string json = parsed.ResponseContentText?.Trim() ?? "";
-            List<(string toolName, Dictionary<string, object?> args)> parsedCalls =
-                TryParseToolCallsFromJson(json);
-
-            if (parsedCalls.Count == 0)
-            {
-                return parsedCalls;
-            }
-
-            // Guardrail: parser-model calls must be grounded in assistant output.
-            // This prevents tool hallucinations (e.g. injecting unrelated BASH calls).
-            HashSet<string> declaredTools = ExtractDeclaredToolNamesFromAssistantText(assistantText);
-            return parsedCalls
-                .Where(call => IsParserCallGroundedInAssistantText(call, assistantText, declaredTools))
-                .ToList();
-        }
-
-        private static HashSet<string> ExtractDeclaredToolNamesFromAssistantText(string assistantText)
-        {
-            HashSet<string> names = new(StringComparer.OrdinalIgnoreCase);
-            if (string.IsNullOrWhiteSpace(assistantText))
-            {
-                return names;
-            }
-
-            string[] lines = assistantText.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            foreach (string rawLine in lines)
-            {
-                string line = rawLine.Trim();
-                if (!line.StartsWith("tool:", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                string after = line["tool:".Length..].Trim();
-                int openParen = after.IndexOf('(');
-                if (openParen <= 0)
-                {
-                    continue;
-                }
-
-                string toolName = after[..openParen].Trim();
-                if (!string.IsNullOrWhiteSpace(toolName))
-                {
-                    names.Add(toolName);
-                }
-            }
-
-            return names;
-        }
-
-        private static bool IsParserCallGroundedInAssistantText(
-            (string toolName, Dictionary<string, object?> args) call,
-            string assistantText,
-            HashSet<string> declaredTools)
-        {
-            if (string.IsNullOrWhiteSpace(call.toolName))
-            {
-                return false;
-            }
-
-            if (!declaredTools.Contains(call.toolName))
-            {
-                return false;
-            }
-
-            // Ensure at least one arg key from parser output appears in assistant text.
-            // This allows parser repair for malformed JSON while rejecting fabricated calls.
-            if (call.args.Count == 0)
-            {
-                return true;
-            }
-
-            foreach (string key in call.args.Keys)
-            {
-                if (assistantText.Contains($"\"{key}\"", StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static List<(string toolName, Dictionary<string, object?> args)> TryParseToolCallsFromJson(string payload)
-        {
-            var result = new List<(string toolName, Dictionary<string, object?> args)>();
-            if (string.IsNullOrWhiteSpace(payload))
-            {
-                return result;
-            }
-
-            string json = payload.Trim();
-            if (json.StartsWith("```", StringComparison.Ordinal))
-            {
-                int firstNl = json.IndexOf('\n');
-                if (firstNl >= 0)
-                {
-                    json = json[(firstNl + 1)..];
-                }
-                int fence = json.LastIndexOf("```", StringComparison.Ordinal);
-                if (fence >= 0)
-                {
-                    json = json[..fence];
-                }
-                json = json.Trim();
-            }
-
-            try
-            {
-                using JsonDocument doc = JsonDocument.Parse(json);
-                if (!doc.RootElement.TryGetProperty("calls", out JsonElement calls) ||
-                    calls.ValueKind != JsonValueKind.Array)
-                {
-                    return result;
-                }
-
-                foreach (JsonElement call in calls.EnumerateArray())
-                {
-                    if (!call.TryGetProperty("toolName", out JsonElement nameEl))
-                    {
-                        continue;
-                    }
-
-                    string? toolName = nameEl.GetString();
-                    if (string.IsNullOrWhiteSpace(toolName))
-                    {
-                        continue;
-                    }
-
-                    Dictionary<string, object?> args = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-                    if (call.TryGetProperty("args", out JsonElement argsEl) &&
-                        argsEl.ValueKind == JsonValueKind.Object)
-                    {
-                        foreach (JsonProperty prop in argsEl.EnumerateObject())
-                        {
-                            args[prop.Name] = prop.Value.Clone();
-                        }
-                    }
-
-                    result.Add((toolName, args));
-                }
-            }
-            catch
-            {
-                return new List<(string toolName, Dictionary<string, object?> args)>();
-            }
-
-            return result;
+            return toolKit.ExtractToolCallInvocations(assistantText);
         }
 
         private Task<string> BuildToolBridgeMessageAsync(
@@ -969,6 +840,12 @@ namespace SeeSharp.Models
             return sb.ToString().TrimEnd();
         }
 
+        private sealed class CreateResponseResult
+        {
+            public required string ResponseId { get; init; }
+            public required string ResponseContentText { get; init; }
+        }
+
         private sealed class TaskCompletionAssessment
         {
             public bool IsComplete { get; set; }
@@ -996,122 +873,21 @@ namespace SeeSharp.Models
             public string Summary { get; set; } = "";
         }
 
-        private async Task<TaskCompletionAssessment> AssessTaskCompletionAsync(
-            ResponsesClient responsesClient,
-            string task,
-            string assistantAnswer,
-            IReadOnlyList<ToolExecutionEnvelope> latestToolOutputs,
-            string repoContext,
-            CancellationToken cancellationToken)
+        /// <summary>
+        /// Fully deterministic task-completion assessment based on tool evidence analysis.
+        /// Eliminates the per-turn LLM validator call (~33% more LLM savings).
+        /// </summary>
+        private static TaskCompletionAssessment AssessTaskCompletion(
+            IReadOnlyList<ToolExecutionEnvelope> latestToolOutputs)
         {
             EvidenceState evidence = AnalyzeEvidenceState(latestToolOutputs);
-            if (evidence.NeedsVerification && !evidence.Verified)
+            bool isComplete = !evidence.NeedsVerification || evidence.Verified;
+            return new TaskCompletionAssessment
             {
-                return new TaskCompletionAssessment
-                {
-                    IsComplete = false,
-                    Gap = evidence.Gap,
-                    NextActionHint = evidence.NextActionHint
-                };
-            }
-
-            string outputsJson = JsonSerializer.Serialize(latestToolOutputs);
-            if (outputsJson.Length > 8_000)
-            {
-                outputsJson = outputsJson[..8_000] + "\n[...truncated for validation safety...]";
-            }
-
-            StringBuilder validatorPrompt = new StringBuilder();
-            validatorPrompt.AppendLine("You are a strict task-completion validator.");
-            validatorPrompt.AppendLine("Decide whether the assistant actually completed the user's task intent.");
-            validatorPrompt.AppendLine("Use the task, assistant answer, and tool evidence.");
-            validatorPrompt.AppendLine("Return ONLY valid JSON with this exact schema:");
-            validatorPrompt.AppendLine("{\"isComplete\":true|false,\"gap\":\"...\",\"nextActionHint\":\"...\"}");
-            validatorPrompt.AppendLine("Rules:");
-            validatorPrompt.AppendLine("- Mark false if commands failed (non-zero exits) and success wasn't later proven.");
-            validatorPrompt.AppendLine("- Mark false if the answer claims completion without concrete evidence.");
-            validatorPrompt.AppendLine("- For file creation/edit tasks, require evidence that file exists or was read after write.");
-            validatorPrompt.AppendLine("- For service/container tasks, require evidence service is up/healthy.");
-            validatorPrompt.AppendLine("- Keep gap and nextActionHint short and actionable.");
-            validatorPrompt.AppendLine();
-            validatorPrompt.AppendLine("Task:");
-            validatorPrompt.AppendLine(task);
-            validatorPrompt.AppendLine();
-            validatorPrompt.AppendLine("Assistant answer:");
-            validatorPrompt.AppendLine(assistantAnswer);
-            validatorPrompt.AppendLine();
-            validatorPrompt.AppendLine("Deterministic evidence summary:");
-            validatorPrompt.AppendLine(evidence.Summary);
-            validatorPrompt.AppendLine();
-            validatorPrompt.AppendLine("Latest tool outputs JSON:");
-            validatorPrompt.AppendLine(outputsJson);
-
-            try
-            {
-                CreateResponseResult parsed = await WithPerCallTimeoutAndTelemetryAsync(
-                    "[Agent] completion validator",
-                    TerminalTone.Reasoning,
-                    AgentDefaults.ResponsesApiCallTimeout,
-                    ct => CreateResponseWithRetryAsync(
-                        modelId: DefaultToolInvocationHandlerModel,
-                        input: validatorPrompt.ToString(),
-                        lmStudioResponsesClient: responsesClient,
-                        repoContext: repoContext,
-                        compactPrompt: false,
-                        streamOutput: false,
-                        cancellation: ct),
-                    cancellationToken).ConfigureAwait(false);
-
-                string json = parsed.ResponseContentText?.Trim() ?? "";
-                if (json.StartsWith("```", StringComparison.Ordinal))
-                {
-                    int firstNl = json.IndexOf('\n');
-                    if (firstNl >= 0)
-                    {
-                        json = json[(firstNl + 1)..];
-                    }
-
-                    int fence = json.LastIndexOf("```", StringComparison.Ordinal);
-                    if (fence >= 0)
-                    {
-                        json = json[..fence];
-                    }
-
-                    json = json.Trim();
-                }
-
-                using JsonDocument doc = JsonDocument.Parse(json);
-                JsonElement root = doc.RootElement;
-
-                bool isComplete = root.TryGetProperty("isComplete", out JsonElement completeEl) &&
-                    completeEl.ValueKind == JsonValueKind.True;
-                string gap = root.TryGetProperty("gap", out JsonElement gapEl)
-                    ? (gapEl.ToString() ?? "")
-                    : "";
-                string next = root.TryGetProperty("nextActionHint", out JsonElement nextEl)
-                    ? (nextEl.ToString() ?? "")
-                    : "";
-
-                return new TaskCompletionAssessment
-                {
-                    IsComplete = isComplete,
-                    Gap = gap.Trim(),
-                    NextActionHint = next.Trim()
-                };
-            }
-            catch
-            {
-                return new TaskCompletionAssessment
-                {
-                    IsComplete = !evidence.NeedsVerification || evidence.Verified,
-                    Gap = string.IsNullOrWhiteSpace(evidence.Gap)
-                        ? "Validator response was malformed and completion could not be confirmed."
-                        : evidence.Gap,
-                    NextActionHint = string.IsNullOrWhiteSpace(evidence.NextActionHint)
-                        ? "Run one concrete verification command and report result."
-                        : evidence.NextActionHint
-                };
-            }
+                IsComplete = isComplete,
+                Gap = evidence.Gap,
+                NextActionHint = evidence.NextActionHint
+            };
         }
 
         private static EvidenceState AnalyzeEvidenceState(IReadOnlyList<ToolExecutionEnvelope> outputs)
@@ -1249,19 +1025,17 @@ namespace SeeSharp.Models
         }
 
         private static bool LooksLikeServiceActionCommand(string command) =>
-            Regex.IsMatch(command, @"\b(docker\s+compose|docker\s+container|docker\s+service|kubectl|systemctl|service)\b", RegexOptions.IgnoreCase) &&
-            Regex.IsMatch(command, @"\b(up|start|stop|restart|down|exec)\b", RegexOptions.IgnoreCase);
+            s_serviceAction.IsMatch(command) && s_serviceActionVerb.IsMatch(command);
 
         private static bool LooksLikeServiceStatusCommand(string command) =>
-            Regex.IsMatch(command, @"\bpg_isready\b", RegexOptions.IgnoreCase) ||
-            (Regex.IsMatch(command, @"\b(docker\s+compose|docker\s+container|docker\s+service|kubectl|systemctl|service)\b", RegexOptions.IgnoreCase) &&
-             Regex.IsMatch(command, @"\b(ps|status|logs|inspect|get|describe|health|ready)\b", RegexOptions.IgnoreCase));
+            s_pgIsReady.IsMatch(command) ||
+            (s_serviceAction.IsMatch(command) && s_serviceStatusVerb.IsMatch(command));
 
         private static bool LooksLikeFileWriteCommand(string command) =>
-            Regex.IsMatch(command, @"(>\s*\S+|>>\s*\S+|\b(Set-Content|Add-Content|Out-File|New-Item\s+-ItemType\s+File|tee|touch|cp|mv)\b)", RegexOptions.IgnoreCase);
+            s_fileWriteCmd.IsMatch(command);
 
         private static bool LooksLikeFileReadCommand(string command) =>
-            Regex.IsMatch(command, @"\b(Get-Content|cat|type|less|more|head|tail|ls|dir|Get-ChildItem|Test-Path|stat)\b", RegexOptions.IgnoreCase);
+            s_fileReadCmd.IsMatch(command);
 
         private static string BuildCompletionRetryInput(
             string originalTask,
@@ -1358,8 +1132,8 @@ namespace SeeSharp.Models
         }
 
         const int ContextualizerMaxListLines = 2500;
-        const int ContextualizerMaxFilesToRead = 15;
-        const int ContextualizerMaxCharsPerFile = 48_000;
+        private int ContextualizerMaxFilesToRead => _config.ContextualizerMaxFilesToRead;
+        private int ContextualizerMaxCharsPerFile => _config.ContextualizerMaxCharsPerFile;
         /// <summary>Pick step: huge repo lists can exceed local server limits.</summary>
         const int ContextualizerMaxPickUserChars = 120_000;
         /// <summary>Per-file summary: the full user message (path + file body) for /v1/chat/completions.
@@ -1413,12 +1187,6 @@ namespace SeeSharp.Models
                 "Favor a smaller, high-signal set (e.g. project file, program entry, core abstractions) over" +
                 " long lists of similar files. Use forward slashes as in the list.";
 
-            string summarizeFileUserMessage = 
-                "Summarize the important information in this file for a coding assistant. Focus on facts," +
-                " not opinions. If the file contains code, summarize what the code does." +
-                " If the file contains text, summarize the key points." +
-                " Keep it concise; a few lines at most. No preamble.";
-
             string mergeContextTogetherUserMessage = 
                 "Merge the following per-file notes into one concise repository overview for " +
                 "the main coding assistant. Keep facts only; max ~20 lines. No preamble.";
@@ -1464,7 +1232,12 @@ namespace SeeSharp.Models
             ThemedConsole.WriteLine(TerminalTone.Reasoning,
                 $"[Contextualizer] Picked {picked.Count} file(s): {string.Join(", ", picked)}");
 
+            // Batch files into groups of 3-4 per LLM call to reduce startup LLM calls by 60-80%.
+            const int filesPerBatch = 3;
             var perFileSummaries = new List<string>(picked.Count);
+            var batches = new List<List<(string rel, string content)>>();
+            List<(string rel, string content)>? currentBatch = null;
+
             foreach (string rel in picked)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1482,28 +1255,48 @@ namespace SeeSharp.Models
 
                 string content = contentObj.ToString() ?? "";
                 if (content.Length > ContextualizerMaxCharsPerFile)
+                    content = content[..ContextualizerMaxCharsPerFile] + "\n\n[... truncated ...]";
+
+                if (currentBatch is null || currentBatch.Count >= filesPerBatch)
                 {
-                content = content[..ContextualizerMaxCharsPerFile] + "\n\n[... truncated ...]";
+                    currentBatch = new List<(string, string)>(filesPerBatch);
+                    batches.Add(currentBatch);
                 }
+                currentBatch.Add((rel, content));
+            }
 
-                string user = "File: " + rel + "\n\n" + content;
-                user = AgentUtilities.TruncateMiddleForModel(user, ContextualizerMaxSummaryUserChars);
-                string summary = await CompleteContextualizerChatWithRetriesAsync(
-                    summarizeFileUserMessage,
-                    user,
-                    new ChatCompletionOptions { Temperature = 0.35f, MaxOutputTokenCount = 768 },
+            string batchSummarizeSystem =
+                "Summarize the important information in each file below for a coding assistant. " +
+                "For each file, output a section starting with '### <filepath>' followed by a concise " +
+                "summary (a few lines). Focus on facts, not opinions. No preamble.";
+
+            foreach (var batch in batches)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                StringBuilder batchUser = new();
+                foreach (var (rel, content) in batch)
+                    batchUser.Append("File: ").AppendLine(rel).AppendLine().AppendLine(content).AppendLine();
+
+                string truncatedUser = AgentUtilities.TruncateMiddleForModel(
+                    batchUser.ToString(),
+                    ContextualizerMaxSummaryUserChars * batch.Count);
+
+                string batchSummary = await CompleteContextualizerChatWithRetriesAsync(
+                    batchSummarizeSystem,
+                    truncatedUser,
+                    new ChatCompletionOptions { Temperature = 0.35f, MaxOutputTokenCount = 768 * batch.Count },
                     cancellationToken,
-                    $"summarize: {rel}",
-                    ContextualizerMaxSummaryUserChars).ConfigureAwait(false);
+                    $"summarize batch ({string.Join(", ", batch.Select(b => b.rel))})",
+                    ContextualizerMaxSummaryUserChars * batch.Count).ConfigureAwait(false);
 
-                if (string.IsNullOrWhiteSpace(summary))
+                if (!string.IsNullOrWhiteSpace(batchSummary))
                 {
-                    ThemedConsole.WriteLine(TerminalTone.Error,
-                        $"[Contextualizer] Empty summary for '{rel}' after summarize step.");
+                    perFileSummaries.Add(batchSummary.Trim());
                 }
                 else
                 {
-                    perFileSummaries.Add($"### {rel}\n{summary.Trim()}");
+                    ThemedConsole.WriteLine(TerminalTone.Error,
+                        $"[Contextualizer] Empty summary for batch: {string.Join(", ", batch.Select(b => b.rel))}");
                 }
             }
 
@@ -1716,16 +1509,24 @@ namespace SeeSharp.Models
             return "";
         }
 
-        private sealed class ContextualizerPickDto
-        {
-            public List<string>? Paths { get; set; }
-        }
-
         private string GenerateSystemPrompt()
         {
+            // Full replacement from config takes priority over all generation
+            if (!string.IsNullOrWhiteSpace(_config.SystemPromptReplace))
+            {
+                return _config.SystemPromptReplace;
+            }
 
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine("You are a coding assistant whose goal is to help solve coding tasks with reliable tool usage.");
+
+            // Prepend from config (user personality, custom preamble)
+            if (!string.IsNullOrWhiteSpace(_config.SystemPromptPrepend))
+            {
+                sb.AppendLine(_config.SystemPromptPrepend);
+                sb.AppendLine();
+            }
+
+            sb.AppendLine($"You are {_config.AgentName}, a coding assistant whose goal is to help solve coding tasks with reliable tool usage.");
             sb.AppendLine("You have access to a series of tools you can execute. Here are the tools you can execute:");
             sb.AppendLine(ToolKit.GenerateToolRegistryAsString());
             sb.AppendLine();
@@ -1773,6 +1574,13 @@ namespace SeeSharp.Models
             sb.AppendLine();
             sb.AppendLine("When tool results are provided, consume them and continue until the task is complete.");
             sb.AppendLine("FINAL TURN: provide a normal language answer only after required tools are done.");
+
+            // Append from config (additional rules, persona tweaks)
+            if (!string.IsNullOrWhiteSpace(_config.SystemPromptAppend))
+            {
+                sb.AppendLine();
+                sb.AppendLine(_config.SystemPromptAppend);
+            }
 
             return sb.ToString();
         }

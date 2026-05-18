@@ -60,6 +60,7 @@ public static class LocalTestProjectMenu
         string contextualizerModelId,
         Func<IReadOnlyCollection<string>, CancellationToken, Task>? keepOnlyModelsLoadedAsync,
         Action<string>? onModelActivated,
+        SessionRecorder? sessionRecorder,
         CancellationToken cancellationToken)
     {
         if (models.Count == 0)
@@ -91,6 +92,7 @@ public static class LocalTestProjectMenu
                 contextualizerModelId,
                 keepOnlyModelsLoadedAsync,
                 onModelActivated,
+                sessionRecorder,
                 cancellationToken);
             return;
         }
@@ -129,8 +131,13 @@ public static class LocalTestProjectMenu
                 cancellationToken);
         }
 
-        var toolKit = new LMStudioToolKit();
-        var agent = new LMStudioAgent(firstModel, toolKit, contextualizerChatClient);
+        var config = AgentDefaults.ActiveConfig ?? new ResolvedConfig();
+        var toolKit = new ToolKit(config);
+        var agent = new Agent(firstModel, toolKit, contextualizerChatClient, config)
+        {
+            SessionRecorder = sessionRecorder
+        };
+        sessionRecorder?.RecordSessionStart(firstModel.Id, expanded, contextualizerModelId);
         var taskListForLoop = new List<string>(taskList);
         _ = await agent.AgentLoop(
             new ResponsesClient(credential, clientOptions),
@@ -187,6 +194,7 @@ public static class LocalTestProjectMenu
         string contextualizerModelId,
         Func<IReadOnlyCollection<string>, CancellationToken, Task>? keepOnlyModelsLoadedAsync,
         Action<string>? onModelActivated,
+        SessionRecorder? sessionRecorder,
         CancellationToken cancellationToken)
     {
         string repoRoot = AgentUtilities.ResolveWorkspaceRoot();
@@ -266,7 +274,6 @@ public static class LocalTestProjectMenu
             await keepOnlyModelsLoadedAsync(activeModelIds, cancellationToken);
         }
 
-        var toolKit = new LMStudioToolKit();
         var responsesClient = new ResponsesClient(credential, clientOptions);
         for (int i = 0; i < projects.Count; i++)
         {
@@ -289,7 +296,14 @@ public static class LocalTestProjectMenu
             ThemedConsole.WriteLine(TerminalTone.Reasoning,
                 $"[TestHarness] Running project loop {i + 1}/{projects.Count} at {projectDir}");
 
-            var agent = new LMStudioAgent(model, toolKit, contextualizerChatClient);
+            // Reload config per-project since workspace root changes
+            var projectConfig = SeeSharpConfigLoader.Load(projectDir);
+            var toolKit = new ToolKit(projectConfig);
+            var agent = new Agent(model, toolKit, contextualizerChatClient, projectConfig)
+            {
+                SessionRecorder = sessionRecorder
+            };
+            sessionRecorder?.RecordSessionStart(model.Id, projectDir, contextualizerModelId);
             _ = await agent.AgentLoop(responsesClient, new List<string>(tasks), cancellationToken);
         }
     }

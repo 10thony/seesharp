@@ -244,7 +244,7 @@ namespace SeeSharp.Models
             string tail = tailLen == 0 ? "" : text[^tailLen..];
             return head + gap + tail;
         }
-        static string StripMarkdownFence(string raw)
+        public static string StripMarkdownFence(string raw)
         {
             string s = raw.Trim();
             if (!s.StartsWith("```", StringComparison.Ordinal))
