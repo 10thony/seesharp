@@ -1,0 +1,36 @@
+body {
+    font-family: system-ui, sans-serif;
+    margin: 1.5rem;
+}
+
+.container {
+    max-width: 40rem;
+}
+
+.row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+
+.col-1 {
+    width: 4rem;
+}
+
+.col-5,
+.col-6 {
+    flex: 1;
+}
+
+.w-100 {
+    width: 100%;
+}
+
+.text-end {
+    text-align: right;
+}
+
+.p-1 {
+    padding: 0.25rem 0;
+}
