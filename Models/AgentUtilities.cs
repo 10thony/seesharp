@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace SeeSharp.Models
 {
@@ -17,6 +18,7 @@ namespace SeeSharp.Models
         public const int ContextualizerMaxListLines = 2500;
         public const int ContextualizerMaxFilesToRead = 15;
         public const int ContextualizerMaxCharsPerFile = 48_000;
+        private static readonly AsyncLocal<string?> s_workspaceRootOverride = new();
         public static readonly JsonSerializerOptions s_contextualizerJson = new()
         { PropertyNameCaseInsensitive = true };
 
@@ -459,8 +461,26 @@ namespace SeeSharp.Models
             return pathStr;
         }
 
+        public static IDisposable PushWorkspaceRoot(string workspaceRoot)
+        {
+            if (string.IsNullOrWhiteSpace(workspaceRoot))
+                throw new ArgumentException("Workspace root is required.", nameof(workspaceRoot));
+
+            string? previous = s_workspaceRootOverride.Value;
+            s_workspaceRootOverride.Value = Path.GetFullPath(workspaceRoot);
+            return new WorkspaceRootScope(previous);
+        }
+
         public static string ResolveWorkspaceRoot()
         {
+            string? scopedRoot = s_workspaceRootOverride.Value;
+            if (!string.IsNullOrWhiteSpace(scopedRoot))
+            {
+                string expandedScopedRoot = Path.GetFullPath(scopedRoot.Trim());
+                if (Directory.Exists(expandedScopedRoot))
+                    return expandedScopedRoot;
+            }
+
             string? env = Environment.GetEnvironmentVariable("HARNESS_WORKSPACE_ROOT");
             if (!string.IsNullOrWhiteSpace(env))
             {
@@ -483,6 +503,26 @@ namespace SeeSharp.Models
             }
 
             return Directory.GetCurrentDirectory();
+        }
+
+        private sealed class WorkspaceRootScope : IDisposable
+        {
+            private readonly string? _previous;
+            private bool _disposed;
+
+            public WorkspaceRootScope(string? previous)
+            {
+                _previous = previous;
+            }
+
+            public void Dispose()
+            {
+                if (_disposed)
+                    return;
+
+                s_workspaceRootOverride.Value = _previous;
+                _disposed = true;
+            }
         }
     }
 }
