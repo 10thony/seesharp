@@ -132,15 +132,24 @@ public static class LocalTestProjectMenu
         }
 
         var config = AgentDefaults.ActiveConfig ?? new ResolvedConfig();
-        var toolKit = new ToolKit(config);
-        var agent = new Agent(firstModel, toolKit, contextualizerChatClient, config)
-        {
-            SessionRecorder = sessionRecorder
-        };
+        var responsesClient = new ResponsesClient(credential, clientOptions);
+        string lmStudioBaseUri = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URI")
+            ?? "http://cobec-spark:1234/v1";
+        string apiKey = Environment.GetEnvironmentVariable("LMSTUDIO_API_KEY") ?? "lm-studio";
+        using AgentRuntime runtime = AgentRuntimeFactory.Create(
+            firstModel,
+            config,
+            responsesClient,
+            contextualizerChatClient,
+            lmStudioBaseUri,
+            apiKey,
+            keepOnlyModelsLoadedAsync,
+            sessionRecorder);
+
         sessionRecorder?.RecordSessionStart(firstModel.Id, expanded, contextualizerModelId);
         var taskListForLoop = new List<string>(taskList);
-        _ = await agent.AgentLoop(
-            new ResponsesClient(credential, clientOptions),
+        _ = await runtime.Agent.AgentLoop(
+            responsesClient,
             taskListForLoop,
             cancellationToken);
     }

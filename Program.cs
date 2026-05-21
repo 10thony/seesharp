@@ -139,19 +139,22 @@ try
         "Create a SQL file to create a user table with columns for ID (auto generated and incrementing Primary Key), name, role_id, labor_category_code",
     ];
 
-    ToolKit toolKit = new ToolKit(resolvedConfig);
-
     foreach (OpenAIModel model in models)
     {
         MarkModelActive(model.Id);
-        Agent agent = new(model, toolKit, contextualizerChatClient, resolvedConfig)
-        {
-            SessionRecorder = sessionRecorder
-        };
+        using AgentRuntime runtime = AgentRuntimeFactory.Create(
+            model,
+            resolvedConfig,
+            lmStudioResponsesClient,
+            contextualizerChatClient,
+            lmStudioBaseUri,
+            apiKey,
+            (keepOnlyIds, token) => KeepOnlyModelsLoadedAsync(models, keepOnlyIds, lmStudioBaseUri, apiKey, token),
+            sessionRecorder);
         sessionRecorder.RecordSessionStart(model.Id, configWorkspaceRoot, contextualizerModelId);
 
         StringBuilder agentLoopStrings = await
-               agent.AgentLoop(new ResponsesClient(credential, clientOptions),
+               runtime.Agent.AgentLoop(lmStudioResponsesClient,
                                questions,
                                cts.Token);
     }
