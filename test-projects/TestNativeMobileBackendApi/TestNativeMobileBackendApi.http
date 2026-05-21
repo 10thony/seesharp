@@ -1,6 +1,81 @@
-@TestNativeMobileBackendApi_HostAddress = http://localhost:5092
+@TestNativeMobileBackendApi_HostAddress = http://localhost:5000
 
-GET {{TestNativeMobileBackendApi_HostAddress}}/weatherforecast/
-Accept: application/json
+### Login (seeded demo user — password Password1!)
+# @name login
+POST {{TestNativeMobileBackendApi_HostAddress}}/api/auth/login
+Content-Type: application/json
+
+{
+  "userName": "demo",
+  "password": "Password1!"
+}
 
 ###
+
+@token = {{login.response.body.$.accessToken}}
+@refreshToken = {{login.response.body.$.refreshToken}}
+
+### Current user profile
+GET {{TestNativeMobileBackendApi_HostAddress}}/api/auth/me
+Authorization: Bearer {{token}}
+
+###
+
+### Refresh access token
+POST {{TestNativeMobileBackendApi_HostAddress}}/api/auth/refresh
+Content-Type: application/json
+
+{
+  "refreshToken": "{{refreshToken}}"
+}
+
+###
+
+### Revoke refresh token
+POST {{TestNativeMobileBackendApi_HostAddress}}/api/auth/revoke
+Content-Type: application/json
+
+{
+  "refreshToken": "{{refreshToken}}"
+}
+
+###
+
+### Revoke all refresh tokens for current user
+POST {{TestNativeMobileBackendApi_HostAddress}}/api/auth/revoke-all
+Authorization: Bearer {{token}}
+
+###
+
+### Recent chat messages (requires JWT)
+GET {{TestNativeMobileBackendApi_HostAddress}}/api/chat/messages?limit=50
+Authorization: Bearer {{token}}
+
+###
+
+### Post chat message (MAUI mobile clients)
+POST {{TestNativeMobileBackendApi_HostAddress}}/api/chat/messages
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "message": "Hello from the mobile app"
+}
+
+###
+
+### Register
+POST {{TestNativeMobileBackendApi_HostAddress}}/api/auth/register
+Content-Type: application/json
+
+{
+  "userName": "newuser",
+  "email": "newuser@local.test",
+  "password": "Password1!",
+  "displayName": "New User"
+}
+
+###
+
+# SignalR hub: /chatHub
+# Invoke SendMessage(message) and listen for ReceiveMessage(userName, message, sentAt)
