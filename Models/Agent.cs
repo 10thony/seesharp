@@ -63,8 +63,8 @@ namespace SeeSharp.Models
         private const int MaxSerializedToolOutputChars = 12_000;
         private const int MaxToolStringValueChars = 4_000;
         private const int MaxContextResetAttemptsPerTask = 3;
-        private const bool ShowPerTickModelWaitLogs = false;
-        private const bool StreamMainModelOutputByDefault = true;
+        private static readonly bool ShowPerTickModelWaitLogs = false;
+        private static readonly bool StreamMainModelOutputByDefault = true;
 
         private int MaxAgentTurnsPerTask => _config.MaxAgentTurnsPerTask;
         private int MaxToolCallsPerTurn => _config.MaxToolCallsPerTurn;
@@ -72,7 +72,18 @@ namespace SeeSharp.Models
         private int MaxResponseRetries => _config.MaxResponseRetries;
         private int MaxNoProgressTurns => _config.MaxNoProgressTurns;
 
-        public OpenAIModel Model { get; set; }
+        public OpenAIModel? Model { get; set; }
+
+        /// <summary>
+        /// Model ID string used for API calls. Falls back to Model.Id if set.
+        /// Allows subagents to operate without a full OpenAIModel instance.
+        /// </summary>
+        public string ModelId
+        {
+            get => _modelIdOverride ?? Model?.Id ?? "";
+            set => _modelIdOverride = value;
+        }
+        private string? _modelIdOverride;
         private ToolKit ToolKit { get; set;  }
         private readonly ChatClient? _contextualizerChatClient;
         private SessionRecorder? _sessionRecorder;
@@ -82,8 +93,39 @@ namespace SeeSharp.Models
             get => _sessionRecorder;
             set => _sessionRecorder = value;
         }
-        
-        public Agent(OpenAIModel model,
+
+        /// <summary>
+        /// GPU inference coordinator. When set, LLM calls acquire/release inference slots.
+        /// Null means no gating (backward compatible).
+        /// </summary>
+        public InferenceCoordinator? InferenceCoordinator { get; set; }
+
+        /// <summary>Unique ID for this agent instance (used by InferenceCoordinator tracking).</summary>
+        public string AgentId { get; set; } = "parent";
+
+        /// <summary>Spawn depth (0 = root parent, 1+ = subagent).</summary>
+        private int _depth;
+        public int Depth
+        {
+            get => _depth;
+            set
+            {
+                _depth = value;
+                if (ToolKit is not null)
+                    ToolKit.ParentAgentDepth = value;
+            }
+        }
+
+        /// <summary>Pre-computed repo context shared from parent (avoids re-contextualization).</summary>
+        public string? SharedRepoContext { get; set; }
+
+        /// <summary>Repository context prepared for this agent's current loop.</summary>
+        public string? CurrentRepoContext { get; private set; }
+
+        /// <summary>Total turns executed across all tasks (used by SubAgentManager for metrics).</summary>
+        public int TotalTurnsExecuted { get; private set; }
+
+        public Agent(OpenAIModel? model,
                      ToolKit toolRegistry,
                      ChatClient? contextualizerChatClient = null,
                      ResolvedConfig? config = null)
@@ -92,6 +134,7 @@ namespace SeeSharp.Models
             this.ToolKit = toolRegistry;
             _contextualizerChatClient = contextualizerChatClient;
             _config = config ?? AgentDefaults.ActiveConfig ?? new ResolvedConfig();
+            toolRegistry.ParentAgentDepth = Depth;
         }
 
         public async Task<StringBuilder> AgentLoop(
@@ -108,20 +151,29 @@ namespace SeeSharp.Models
             StringBuilder sb = new StringBuilder();
             string repoContext = "";
 
-            try
+            // Subagents with shared repo context skip contextualization entirely
+            if (!string.IsNullOrWhiteSpace(SharedRepoContext))
             {
-                sb.AppendLine($"Contextualizing Agent with local project." +
-                    $"; Running model {this.Model.Id}");
-
+                repoContext = SharedRepoContext;
+                sb.AppendLine($"[SubAgent {AgentId}] Using shared repo context from parent; model {this.ModelId}");
                 ThemedConsole.WriteLine(TerminalTone.Reasoning, sb.ToString());
-                repoContext = await ContextualizeAgentAsync(tasks.First(), cancellationToken)
-                    .ConfigureAwait(false);
             }
-            catch (Exception ex)
+            else
             {
-                ThemedConsole.WriteLine(TerminalTone.Error, "[Contextualizer] Exception during contextualization:");
-                ThemedConsole.WriteLine(TerminalTone.Error, FormatExceptionDetail(ex));
-                //add resiliant context generating here. if it fails we should indicate and retry atleast thrice
+                try
+                {
+                    sb.AppendLine($"Contextualizing Agent with local project." +
+                        $"; Running model {this.ModelId}");
+
+                    ThemedConsole.WriteLine(TerminalTone.Reasoning, sb.ToString());
+                    repoContext = await ContextualizeAgentAsync(tasks.First(), cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    ThemedConsole.WriteLine(TerminalTone.Error, "[Contextualizer] Exception during contextualization:");
+                    ThemedConsole.WriteLine(TerminalTone.Error, FormatExceptionDetail(ex));
+                }
             }
 
             if (string.IsNullOrEmpty(repoContext))
@@ -133,6 +185,8 @@ namespace SeeSharp.Models
 
             if (!string.IsNullOrWhiteSpace(repoContext))
             {
+                CurrentRepoContext = repoContext;
+                ToolKit.SubAgentManager?.SetSharedRepoContext(repoContext);
                 _sessionRecorder?.RecordRepoContext(repoContext);
             }
 
@@ -176,6 +230,7 @@ namespace SeeSharp.Models
                 if (!string.IsNullOrWhiteSpace(finalAnswer))
                 {
                     ThemedConsole.WriteLine(TerminalTone.Agent, $" {finalAnswer}");
+                    sb.AppendLine($"Agent: {finalAnswer}");
                 }
 
                 taskIndex++;
@@ -212,6 +267,7 @@ namespace SeeSharp.Models
 
             for (int turn = 0; turn < MaxAgentTurnsPerTask; turn++)
             {
+                TotalTurnsExecuted++;
                 string? perTurnRepoContext = (turn == 0 || shouldRehydrateRepoContext) ? repoContext : null;
                 shouldRehydrateRepoContext = false;
                 CreateResponseResult assistantResponse;
@@ -222,7 +278,7 @@ namespace SeeSharp.Models
                         TerminalTone.Reasoning,
                         AgentDefaults.ResponsesApiCallTimeout,
                         ct => CreateResponseWithRetryAsync(
-                            modelId: this.Model.Id,
+                            modelId: this.ModelId,
                             input: currentInput,
                             lmStudioResponsesClient: responsesClient,
                             repoContext: perTurnRepoContext,
@@ -338,12 +394,21 @@ namespace SeeSharp.Models
                     }
                 }
 
-                var activeTasks = pendingWork
-                    .Where(p => p.execTask is not null)
-                    .Select(p => p.execTask!)
-                    .ToArray();
-                if (activeTasks.Length > 0)
-                    await Task.WhenAll(activeTasks).ConfigureAwait(false);
+                // Signal GPU-free window to allow subagents to acquire inference
+                InferenceCoordinator?.NotifyToolExecutionStarted(AgentId);
+                try
+                {
+                    var activeTasks = pendingWork
+                        .Where(p => p.execTask is not null)
+                        .Select(p => p.execTask!)
+                        .ToArray();
+                    if (activeTasks.Length > 0)
+                        await Task.WhenAll(activeTasks).ConfigureAwait(false);
+                }
+                finally
+                {
+                    InferenceCoordinator?.NotifyToolExecutionCompleted(AgentId);
+                }
 
                 List<ToolExecutionEnvelope> toolOutputs = new(invocations.Count);
                 foreach (var (idx, toolName, args, execTask, immediateResult) in pendingWork)
@@ -1575,6 +1640,21 @@ namespace SeeSharp.Models
             sb.AppendLine("When tool results are provided, consume them and continue until the task is complete.");
             sb.AppendLine("FINAL TURN: provide a normal language answer only after required tools are done.");
 
+            // Subagent tool guidance (only when subagent tools are registered)
+            if (_config.SubAgentsEnabled && ToolKit.SubAgentManager is not null)
+            {
+                sb.AppendLine();
+                sb.AppendLine("SUBAGENT ORCHESTRATION (hardware-aware):");
+                sb.AppendLine("- You can spawn child agents (SPAWN_SUBAGENT) for independent multi-step work.");
+                sb.AppendLine("- IMPORTANT: Subagents share the same GPU for inference; they progress during YOUR tool execution time, not in true parallel.");
+                sb.AppendLine("- After spawning, prefer issuing your own tool calls (BASH, WEB_CALL); this creates inference windows for subagents to work.");
+                sb.AppendLine("- Do NOT spawn for single-command tasks; just do them directly.");
+                sb.AppendLine("- CHECK subagents (CHECK_SUBAGENT) after your own tool calls complete; they have likely progressed during that time.");
+                sb.AppendLine("- KILL subagents (KILL_SUBAGENT) that are stuck or no longer needed.");
+                sb.AppendLine("- Good spawn candidates: file creation suites, exploration tasks, setup work, independent schema/code generation.");
+                sb.AppendLine("- Bad spawn candidates: single file reads, one-liner commands, tasks you need the answer for immediately.");
+            }
+
             // Append from config (additional rules, persona tweaks)
             if (!string.IsNullOrWhiteSpace(_config.SystemPromptAppend))
             {
@@ -1667,6 +1747,22 @@ namespace SeeSharp.Models
             {
                 try
                 {
+                    // Acquire inference slot if coordinator is active (GPU gating)
+                    if (InferenceCoordinator is not null)
+                    {
+                        using var slot = await InferenceCoordinator.AcquireInferenceSlotAsync(
+                            AgentId, modelId, cancellation).ConfigureAwait(false);
+
+                        return await StartNewResponseAsync(
+                            modelId: modelId,
+                            input: currentInput,
+                            lmStudioResponsesClient: lmStudioResponsesClient,
+                            repoContext: currentRepoContext,
+                            compactPrompt: useCompactPrompt,
+                            streamOutput: streamOutput,
+                            cancellation: cancellation).ConfigureAwait(false);
+                    }
+
                     return await StartNewResponseAsync(
                         modelId: modelId,
                         input: currentInput,
@@ -1683,7 +1779,6 @@ namespace SeeSharp.Models
                 catch (Exception ex) when (IsContextWindowExceeded(ex))
                 {
                     last = ex;
-                    // Progressive context shedding: compact prompt, shorter user message, then drop repo context.
                     useCompactPrompt = true;
                     if (currentInput.Length > 2800)
                     {
