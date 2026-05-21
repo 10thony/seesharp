@@ -31,6 +31,17 @@ namespace SeeSharp.Models
         public const string WEB_CALL_TOOL_NAME = "WEB_CALL";
         public const string BASH_TOOL_NAME = "BASH";
         public const string CONFIG_EDIT_TOOL_NAME = "CONFIG_EDIT";
+        public const string SPAWN_SUBAGENT_TOOL_NAME = "SPAWN_SUBAGENT";
+        public const string CHECK_SUBAGENT_TOOL_NAME = "CHECK_SUBAGENT";
+        public const string KILL_SUBAGENT_TOOL_NAME = "KILL_SUBAGENT";
+
+        // SubAgent defaults
+        public const int DefaultSubAgentMaxConcurrent = 2;
+        public const int DefaultSubAgentMaxDepth = 2;
+        public const int DefaultSubAgentMaxTurns = 12;
+        public const int DefaultSubAgentMaxToolExecutions = 10;
+        public static readonly TimeSpan DefaultSubAgentInferenceTimeout = TimeSpan.FromSeconds(120);
+        public static readonly TimeSpan DefaultSubAgentModelSwapTimeout = TimeSpan.FromSeconds(15);
 
         // --- Config-aware accessors ---
 

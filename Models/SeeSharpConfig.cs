@@ -41,6 +41,9 @@ namespace SeeSharp.Models
 
         [JsonPropertyName("theme")]
         public ConsoleThemeConfig? Theme { get; set; }
+
+        [JsonPropertyName("subAgents")]
+        public SubAgentConfig? SubAgents { get; set; }
     }
 
     public sealed class AgentLimitsConfig
@@ -142,6 +145,40 @@ namespace SeeSharp.Models
         public string? Body { get; set; }
     }
 
+    public sealed class SubAgentConfig
+    {
+        [JsonPropertyName("enabled")]
+        public bool? Enabled { get; set; }
+
+        /// <summary>"sameModel", "tieredModels", or "dedicatedSwap"</summary>
+        [JsonPropertyName("modelStrategy")]
+        public string? ModelStrategy { get; set; }
+
+        [JsonPropertyName("subAgentModelId")]
+        public string? SubAgentModelId { get; set; }
+
+        [JsonPropertyName("maxConcurrent")]
+        public int? MaxConcurrent { get; set; }
+
+        [JsonPropertyName("maxDepth")]
+        public int? MaxDepth { get; set; }
+
+        [JsonPropertyName("maxTurnsPerSubAgent")]
+        public int? MaxTurnsPerSubAgent { get; set; }
+
+        [JsonPropertyName("maxToolExecutionsPerSubAgent")]
+        public int? MaxToolExecutionsPerSubAgent { get; set; }
+
+        [JsonPropertyName("shareRepoContext")]
+        public bool? ShareRepoContext { get; set; }
+
+        [JsonPropertyName("inferenceTimeoutSeconds")]
+        public int? InferenceTimeoutSeconds { get; set; }
+
+        [JsonPropertyName("modelSwapTimeoutSeconds")]
+        public int? ModelSwapTimeoutSeconds { get; set; }
+    }
+
     public sealed class ConsoleThemeConfig
     {
         [JsonPropertyName("agentColor")]
@@ -211,6 +248,18 @@ namespace SeeSharp.Models
         public ConsoleColor ReasoningColor { get; set; } = ConsoleColor.DarkCyan;
         public ConsoleColor UserColor { get; set; } = ConsoleColor.Magenta;
         public ConsoleColor ActionColor { get; set; } = ConsoleColor.Yellow;
+
+        // SubAgents
+        public bool SubAgentsEnabled { get; set; } = false;
+        public ModelSchedulingStrategy SubAgentModelStrategy { get; set; } = ModelSchedulingStrategy.TieredModels;
+        public string SubAgentModelId { get; set; } = "qwen/qwen3.5-2b";
+        public int SubAgentMaxConcurrent { get; set; } = AgentDefaults.DefaultSubAgentMaxConcurrent;
+        public int SubAgentMaxDepth { get; set; } = AgentDefaults.DefaultSubAgentMaxDepth;
+        public int SubAgentMaxTurnsPerAgent { get; set; } = AgentDefaults.DefaultSubAgentMaxTurns;
+        public int SubAgentMaxToolExecutionsPerAgent { get; set; } = AgentDefaults.DefaultSubAgentMaxToolExecutions;
+        public bool SubAgentShareRepoContext { get; set; } = true;
+        public TimeSpan SubAgentInferenceTimeout { get; set; } = AgentDefaults.DefaultSubAgentInferenceTimeout;
+        public TimeSpan SubAgentModelSwapTimeout { get; set; } = AgentDefaults.DefaultSubAgentModelSwapTimeout;
 
         // Source tracking for diagnostics
         public string? GlobalConfigPath { get; set; }

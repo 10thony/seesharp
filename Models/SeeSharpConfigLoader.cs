@@ -193,6 +193,7 @@ namespace SeeSharp.Models
             MergeCustomTools(resolved, layer.CustomTools);
             MergeDisabledTools(resolved, layer.DisabledTools);
             MergeTheme(resolved, layer.Theme);
+            MergeSubAgents(resolved, layer.SubAgents);
         }
 
         private static void MergeLimits(ResolvedConfig resolved, AgentLimitsConfig? limits)
@@ -290,6 +291,40 @@ namespace SeeSharp.Models
                 resolved.ActionColor = c;
         }
 
+        private static void MergeSubAgents(ResolvedConfig resolved, SubAgentConfig? sub)
+        {
+            if (sub is null) return;
+
+            if (sub.Enabled.HasValue)
+                resolved.SubAgentsEnabled = sub.Enabled.Value;
+            if (!string.IsNullOrWhiteSpace(sub.ModelStrategy))
+            {
+                resolved.SubAgentModelStrategy = sub.ModelStrategy.ToLowerInvariant() switch
+                {
+                    "samemodel" => ModelSchedulingStrategy.SameModel,
+                    "tieredmodels" => ModelSchedulingStrategy.TieredModels,
+                    "dedicatedswap" => ModelSchedulingStrategy.DedicatedSwap,
+                    _ => resolved.SubAgentModelStrategy
+                };
+            }
+            if (!string.IsNullOrWhiteSpace(sub.SubAgentModelId))
+                resolved.SubAgentModelId = sub.SubAgentModelId;
+            if (sub.MaxConcurrent.HasValue)
+                resolved.SubAgentMaxConcurrent = sub.MaxConcurrent.Value;
+            if (sub.MaxDepth.HasValue)
+                resolved.SubAgentMaxDepth = sub.MaxDepth.Value;
+            if (sub.MaxTurnsPerSubAgent.HasValue)
+                resolved.SubAgentMaxTurnsPerAgent = sub.MaxTurnsPerSubAgent.Value;
+            if (sub.MaxToolExecutionsPerSubAgent.HasValue)
+                resolved.SubAgentMaxToolExecutionsPerAgent = sub.MaxToolExecutionsPerSubAgent.Value;
+            if (sub.ShareRepoContext.HasValue)
+                resolved.SubAgentShareRepoContext = sub.ShareRepoContext.Value;
+            if (sub.InferenceTimeoutSeconds.HasValue)
+                resolved.SubAgentInferenceTimeout = TimeSpan.FromSeconds(sub.InferenceTimeoutSeconds.Value);
+            if (sub.ModelSwapTimeoutSeconds.HasValue)
+                resolved.SubAgentModelSwapTimeout = TimeSpan.FromSeconds(sub.ModelSwapTimeoutSeconds.Value);
+        }
+
         private static void ApplyEnvironmentOverrides(ResolvedConfig resolved)
         {
             string? bashTimeout = Environment.GetEnvironmentVariable("SEESHARP_BASH_TIMEOUT_SECONDS");
@@ -333,6 +368,21 @@ namespace SeeSharp.Models
                 resolved.ContextualizerCallTimeout = TimeSpan.FromSeconds(30);
             if (resolved.ContextualizerCallTimeout > TimeSpan.FromMinutes(60))
                 resolved.ContextualizerCallTimeout = TimeSpan.FromMinutes(60);
+
+            resolved.SubAgentMaxConcurrent = Clamp(resolved.SubAgentMaxConcurrent, 1, 8);
+            resolved.SubAgentMaxDepth = Clamp(resolved.SubAgentMaxDepth, 1, 5);
+            resolved.SubAgentMaxTurnsPerAgent = Clamp(resolved.SubAgentMaxTurnsPerAgent, 1, resolved.MaxAgentTurnsPerTask);
+            resolved.SubAgentMaxToolExecutionsPerAgent = Clamp(resolved.SubAgentMaxToolExecutionsPerAgent, 1, resolved.MaxSuccessfulToolExecutionsPerTask);
+            if (resolved.SubAgentInferenceTimeout < TimeSpan.FromSeconds(5))
+                resolved.SubAgentInferenceTimeout = TimeSpan.FromSeconds(5);
+            if (resolved.SubAgentInferenceTimeout > TimeSpan.FromMinutes(10))
+                resolved.SubAgentInferenceTimeout = TimeSpan.FromMinutes(10);
+            if (resolved.SubAgentModelSwapTimeout < TimeSpan.FromSeconds(5))
+                resolved.SubAgentModelSwapTimeout = TimeSpan.FromSeconds(5);
+            if (resolved.SubAgentModelSwapTimeout > TimeSpan.FromMinutes(2))
+                resolved.SubAgentModelSwapTimeout = TimeSpan.FromMinutes(2);
+            if (string.IsNullOrWhiteSpace(resolved.SubAgentModelId))
+                resolved.SubAgentModelId = Agent.DefaultContextualizerModelId;
 
             // Remove custom tools with empty names or descriptions
             resolved.CustomTools.RemoveAll(t =>
