@@ -18,6 +18,16 @@ namespace SeeSharp.Models
         private int _configEditCallsThisTask;
         private const int MaxConfigEditsPerTask = 3;
 
+        /// <summary>
+        /// SubAgent lifecycle manager. Injected when subagent tools are enabled.
+        /// </summary>
+        public SubAgentManager? SubAgentManager { get; set; }
+
+        /// <summary>
+        /// Depth of the agent that owns this toolkit. Used to enforce subagent depth limits.
+        /// </summary>
+        public int ParentAgentDepth { get; set; }
+
         public ToolKit() : this(AgentDefaults.ActiveConfig ?? new ResolvedConfig()) { }
 
         public ToolKit(ResolvedConfig config)
@@ -125,6 +135,27 @@ namespace SeeSharp.Models
                 "    :param path: Dot-delimited config path (e.g. \"limits.bashCommandTimeoutSeconds\", \"agentName\").\r\n" +
                 "    :param value: New value for set action (string, number, or JSON array/object).\r\n" +
                 "    :return: Updated config section or confirmation.");
+
+            if (_config.SubAgentsEnabled && SubAgentManager is not null)
+            {
+                result.Add(AgentDefaults.SPAWN_SUBAGENT_TOOL_NAME,
+                    "Spawns a child agent to work on an independent subtask in the background. " +
+                    "The subagent shares GPU inference with you (it progresses during YOUR tool execution windows, not in true parallel).\r\n" +
+                    "    :param task: Description of the work for the subagent to complete.\r\n" +
+                    "    :param workspace: Optional relative/absolute workspace path for the subagent (defaults to current workspace).\r\n" +
+                    "    :param model: Optional model override for the subagent.\r\n" +
+                    "    :return: Subagent ID and initial status.");
+
+                result.Add(AgentDefaults.CHECK_SUBAGENT_TOOL_NAME,
+                    "Checks the status of a previously spawned subagent.\r\n" +
+                    "    :param id: The subagent ID returned by SPAWN_SUBAGENT.\r\n" +
+                    "    :return: Status (queued/running/completed/failed/killed), turns elapsed, and result if done.");
+
+                result.Add(AgentDefaults.KILL_SUBAGENT_TOOL_NAME,
+                    "Kills a running subagent, freeing its inference claim and resources.\r\n" +
+                    "    :param id: The subagent ID to terminate.\r\n" +
+                    "    :return: Kill confirmation and final status.");
+            }
 
             // Merge user-defined custom tools from config
             foreach (CustomToolDefinition customTool in _config.CustomTools)
@@ -1180,6 +1211,15 @@ namespace SeeSharp.Models
                     case AgentDefaults.CONFIG_EDIT_TOOL_NAME:
                         return ConfigEdit_Tool(args);
 
+                    case AgentDefaults.SPAWN_SUBAGENT_TOOL_NAME:
+                        return ExecuteSpawnSubAgent(args);
+
+                    case AgentDefaults.CHECK_SUBAGENT_TOOL_NAME:
+                        return ExecuteCheckSubAgent(args);
+
+                    case AgentDefaults.KILL_SUBAGENT_TOOL_NAME:
+                        return ExecuteKillSubAgent(args);
+
                     default:
                         // Check if it's a user-defined custom tool
                         CustomToolDefinition? customTool = _config.CustomTools
@@ -1651,6 +1691,67 @@ namespace SeeSharp.Models
             if (string.IsNullOrEmpty(v))
                 throw new ArgumentException($"Missing required argument; expected one of: {string.Join(", ", keys)}");
             return v;
+        }
+
+        private Dictionary<string, object> ExecuteSpawnSubAgent(Dictionary<string, object?> args)
+        {
+            if (SubAgentManager is null)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", "Subagent system is not enabled. Enable it in seesharp.config.json under 'subAgents.enabled'." }
+                };
+            }
+
+            string task = RequireArg(args, "task");
+            string? workspace = OptionalArg(args, "workspace");
+            string? model = OptionalArg(args, "model");
+
+            ThemedConsole.WriteLine(TerminalTone.Tool,
+                $"[Tool] SPAWN_SUBAGENT: task=\"{(task.Length > 60 ? task[..60] + "..." : task)}\"");
+
+            try
+            {
+                var handle = SubAgentManager.Spawn(
+                    task, workspace, model,
+                    parentDepth: ParentAgentDepth,
+                    parentCt: CancellationToken.None);
+                return SubAgentManager.SpawnAsToolResult(handle);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return new Dictionary<string, object> { { "error", ex.Message } };
+            }
+        }
+
+        private Dictionary<string, object> ExecuteCheckSubAgent(Dictionary<string, object?> args)
+        {
+            if (SubAgentManager is null)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", "Subagent system is not enabled." }
+                };
+            }
+
+            string id = RequireArg(args, "id");
+            ThemedConsole.WriteLine(TerminalTone.Tool, $"[Tool] CHECK_SUBAGENT: id={id}");
+            return SubAgentManager.CheckAsToolResult(id);
+        }
+
+        private Dictionary<string, object> ExecuteKillSubAgent(Dictionary<string, object?> args)
+        {
+            if (SubAgentManager is null)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "error", "Subagent system is not enabled." }
+                };
+            }
+
+            string id = RequireArg(args, "id");
+            ThemedConsole.WriteLine(TerminalTone.Tool, $"[Tool] KILL_SUBAGENT: id={id}");
+            return SubAgentManager.KillAsToolResult(id);
         }
 
         private string? OptionalArg(Dictionary<string, object?> args, params string[] keys)
