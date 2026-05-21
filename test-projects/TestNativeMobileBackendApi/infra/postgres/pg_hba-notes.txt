@@ -1,0 +1,16 @@
+PostgreSQL client authentication (local Docker)
+===============================================
+
+The official Postgres image configures SCRAM-SHA-256 password authentication
+for TCP connections by default (successor to MD5 password auth).
+
+- Bootstrap / init scripts run as POSTGRES_USER (chatapp).
+- The application connects as chatapi with password chatapi_password.
+- Application user passwords are stored in app_users.password_hash (ASP.NET
+  Identity format), separate from PostgreSQL role passwords per:
+  https://www.postgresql.org/docs/current/auth-methods.html
+
+To tighten production:
+  1. Rotate chatapi_password and store in a secret manager.
+  2. Restrict pg_hba.conf to required networks only.
+  3. Prefer SSL for remote connections.
