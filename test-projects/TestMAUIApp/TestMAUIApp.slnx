@@ -1,0 +1,16 @@
+<Solution>
+  <Project Path="TestMAUIApp.Droid/TestMAUIApp.Droid.csproj">
+    <Deploy />
+  </Project>
+  <Project Path="TestMAUIApp.iOS/TestMAUIApp.iOS.csproj">
+    <Deploy />
+  </Project>
+  <Project Path="TestMAUIApp.Mac/TestMAUIApp.Mac.csproj">
+    <Deploy />
+  </Project>
+  <Project Path="TestMAUIApp.WinUI/TestMAUIApp.WinUI.csproj">
+    <Platform Project="x64" />
+  </Project>
+  <Project Path="TestMAUIApp/TestMAUIApp.csproj" />
+  <Project Path="RunBoth/RunBoth.csproj" />
+</Solution>
