@@ -1,0 +1,29 @@
+# SeeSharp 2-hour test harness run — COMPLETE
+
+Started: 2026-05-22
+Finished: 2026-05-22 (~1h agent runtime + harness fixes)
+
+## Goal
+Run SeeSharp CLI against test-projects; focus MAUI chat + TestNativeMobileBackendApi server; evaluate agent; produce agent-status-report.md.
+
+## Completed
+- Studied MAUI ChatService, RealtimeChatService, backend ChatController/ChatHub/ChatRepository
+- Fixed LocalTestProjectMenu: primary workspace filter, per-project model load, chat tasks, SEESHARP_HARNESS_ONLY, backend task alignment
+- Pass 1: 4 projects x 6 tasks (~43 min) — session_20260522_151902_14e73a19eb59.jsonl
+- Pass 2: backend-only 7 tasks (~16 min) — session_20260522_160302_2d609675d146.jsonl
+- agent-status-report.md written
+- test-projects git diff: empty (no agent writes landed)
+
+## Key finding
+Contextualizer GOOD; implementation BAD (false completed, no disk changes, EDIT_FILE mismatches, stack hallucination).
+
+## Artifacts
+- artifacts/harness-runs/run_focused_20260522.log
+- artifacts/harness-runs/backend_pass2_20260522.log
+- agent-status-report.md
+- tools/run_harness_batch.ps1, tools/harness_snapshot.ps1
+
+## Next (for maintainer)
+- Tighten AssessTaskCompletion to require file write + read-back for coding tasks
+- Consider qwen3-coder-next for implementation tiers
+- EDIT_FILE fallback when oldContents not found

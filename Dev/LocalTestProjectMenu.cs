@@ -199,7 +199,15 @@ public static class LocalTestProjectMenu
             return;
         }
 
-        Dictionary<string, List<string>> taskMap = BuildGeneratedTaskMap(candidates);
+        List<WorkspaceCandidate> primaryCandidates = candidates
+            .Where(static c => IsPrimaryHarnessWorkspace(c.DirectoryPath))
+            .ToList();
+        if (primaryCandidates.Count == 0)
+        {
+            primaryCandidates = candidates;
+        }
+
+        Dictionary<string, List<string>> taskMap = BuildGeneratedTaskMap(primaryCandidates);
         if (taskMap.Count == 0)
         {
             ThemedConsole.WriteLine(TerminalTone.Error,
@@ -240,22 +248,14 @@ public static class LocalTestProjectMenu
                 $"[TestHarness] Project {i + 1}/{projects.Count}: {projectDir} | tasks={tasks.Count} | model={model.Id}");
         }
 
-        var activeModelIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            contextualizerModelId
-        };
-        for (int i = 0; i < projects.Count; i++)
-        {
-            OpenAIModel selected = SelectModelForProjectIndex(i, qwen36, qwen35);
-            activeModelIds.Add(selected.Id);
-        }
-        foreach (string modelId in activeModelIds)
-        {
-            onModelActivated?.Invoke(modelId);
-        }
+        // Keep only contextualizer + the current project agent loaded. Preloading every
+        // project's model at once causes LM Studio load/cancel churn on limited VRAM.
+        onModelActivated?.Invoke(contextualizerModelId);
         if (keepOnlyModelsLoadedAsync is not null)
         {
-            await keepOnlyModelsLoadedAsync(activeModelIds, cancellationToken);
+            await keepOnlyModelsLoadedAsync(
+                new HashSet<string>(new[] { contextualizerModelId }, StringComparer.OrdinalIgnoreCase),
+                cancellationToken);
         }
 
         var responsesClient = new ResponsesClient(credential, clientOptions);
@@ -273,6 +273,13 @@ public static class LocalTestProjectMenu
             }
 
             OpenAIModel model = SelectModelForProjectIndex(i, qwen36, qwen35);
+            onModelActivated?.Invoke(model.Id);
+            if (keepOnlyModelsLoadedAsync is not null)
+            {
+                await keepOnlyModelsLoadedAsync(
+                    new HashSet<string>(new[] { model.Id, contextualizerModelId }, StringComparer.OrdinalIgnoreCase),
+                    cancellationToken);
+            }
             Environment.SetEnvironmentVariable(
                 "HARNESS_WORKSPACE_ROOT",
                 projectDir,
@@ -425,6 +432,37 @@ public static class LocalTestProjectMenu
         }
     }
 
+    /// <summary>
+    /// Multi-project harness should target one workspace per app (shared MAUI library, API root, etc.),
+    /// not every platform head, test project, or tooling folder under test-projects.
+    /// </summary>
+    static bool IsPrimaryHarnessWorkspace(string directoryPath)
+    {
+        string norm = directoryPath.Replace('\\', '/');
+        string? only = Environment.GetEnvironmentVariable("SEESHARP_HARNESS_ONLY");
+        if (!string.IsNullOrWhiteSpace(only)
+            && norm.IndexOf(only.Trim(), StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            return false;
+        }
+        if (norm.Contains("/RunBoth", StringComparison.OrdinalIgnoreCase)
+            || norm.Contains(".Droid", StringComparison.OrdinalIgnoreCase)
+            || norm.Contains(".iOS", StringComparison.OrdinalIgnoreCase)
+            || norm.Contains(".Mac", StringComparison.OrdinalIgnoreCase)
+            || norm.Contains(".WinUI", StringComparison.OrdinalIgnoreCase)
+            || norm.EndsWith(".Tests", StringComparison.OrdinalIgnoreCase)
+            || norm.Contains("/infra/tools/", StringComparison.OrdinalIgnoreCase)
+            || norm.EndsWith(".Client", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return norm.EndsWith("/TestMAUIApp/TestMAUIApp", StringComparison.OrdinalIgnoreCase)
+            || norm.EndsWith("/TestNativeMobileBackendApi", StringComparison.OrdinalIgnoreCase)
+            || norm.EndsWith("/TestMinimalWebApi", StringComparison.OrdinalIgnoreCase)
+            || norm.EndsWith("/TestSignalRBlazorApp/TestSignalRBlazorApp", StringComparison.OrdinalIgnoreCase);
+    }
+
     static Dictionary<string, List<string>> BuildGeneratedTaskMap(IReadOnlyList<WorkspaceCandidate> candidates)
     {
         var map = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
@@ -470,16 +508,19 @@ public static class LocalTestProjectMenu
             ];
         }
 
-        if (normalized.Contains("testnativemobilebackendapi", StringComparison.Ordinal))
+        if (normalized.Contains("testnativemobilebackendapi", StringComparison.Ordinal)
+            && !normalized.Contains(".tests", StringComparison.Ordinal)
+            && !normalized.Contains("/infra/tools/", StringComparison.Ordinal))
         {
             return
             [
-                "Tier 1: Standardize controller error payloads to one shape containing code and message for all bad request, conflict, and not-found paths.",
-                "Tier 1: Validate ID, Name, and Notes are required for create and edit operations and return typed validation errors.",
-                "Tier 2: Add done and nameContains query options to the list endpoint for filtered retrieval.",
-                "Tier 2: Add deterministic sorting for list output to stabilize results across runs.",
-                "Tier 3: Refactor repository update and delete methods to return explicit success or failure so controller responses are accurate.",
-                "Tier 4: Add controller tests for conflict, not found, validation failure, filtered list, and successful edit and delete flows."
+                "REQUIRED: Read target files with BASH Get-Content -Raw, then apply edits with BASH Set-Content or EDIT_FILE using exact old text. Verify with read-back. Prose-only answers fail validation.",
+                "Tier 1: In ChatController.PostMessage and ChatHub.SendMessage, reject empty or whitespace-only messages with a consistent validation error payload.",
+                "Tier 1: Add max message length guardrails (e.g. 2000 chars) on REST and hub send paths with ProblemDetails or equivalent JSON errors.",
+                "Tier 2: Standardize API error responses to one shape { code, message } for BadRequest, Unauthorized, and Conflict across chat and auth controllers.",
+                "Tier 2: Add optional sinceUtc query parameter to GET api/chat/messages for incremental history fetch with stable ordering.",
+                "Tier 3: Ensure ChatRepository.Insert persists before hub broadcast and handle database failures without broadcasting partial events.",
+                "Tier 4: Add integration tests for chat validation, unauthorized access, successful post + hub ReceiveMessage broadcast, and sinceUtc filtering."
             ];
         }
 
@@ -493,6 +534,20 @@ public static class LocalTestProjectMenu
                 "Tier 2: Add lightweight in-memory presence tracking keyed by connection id and normalized username.",
                 "Tier 3: Add reconnect-safe client flow that re-establishes the hub connection and re-announces presence.",
                 "Tier 4: Add SignalR integration tests for broadcast delivery, validation rejection, and reconnect-presence behavior."
+            ];
+        }
+
+        if (normalized.Contains("testmauiapp", StringComparison.Ordinal)
+            && normalized.EndsWith("/testmauiapp/testmauiapp", StringComparison.Ordinal))
+        {
+            return
+            [
+                "Tier 1: In ChatService and RealtimeChatService, reject empty or whitespace-only message content before calling the API or hub; surface a clear user-visible hint on MainPage.",
+                "Tier 1: Add max message length guardrails (e.g. 2000 chars) on send in the MAUI client aligned with server expectations.",
+                "Tier 2: When RealtimeChatService receives ReceiveMessage, map payload into ChatMessageRecord and persist via DataBridgeService so the list updates without a full refresh.",
+                "Tier 2: On hub reconnect, trigger a server refresh (GetMessagesAsync refreshFromServer) so offline gaps are filled.",
+                "Tier 3: Add defensive handling when API base address is unreachable (show connection status on MainPage, avoid duplicate pending sends).",
+                "Tier 4: Add unit tests for ChatService message mapping and empty-message validation using mocks for HttpService and DataBridgeService."
             ];
         }
 
