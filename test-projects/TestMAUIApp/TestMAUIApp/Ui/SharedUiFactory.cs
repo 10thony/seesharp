@@ -18,8 +18,9 @@ public static class SharedUiFactory
 
         return new Border
         {
+            BackgroundColor = AppPalette.CardBackground,
             StrokeShape = new RoundRectangle { CornerRadius = new CornerRadius(10) },
-            Stroke = Color.FromArgb("#D9D9D9"),
+            Stroke = AppPalette.CardStroke,
             Padding = new Thickness(12),
             Content = stack,
         };
@@ -31,6 +32,8 @@ public static class SharedUiFactory
             Text = text,
             FontSize = 22,
             FontAttributes = FontAttributes.Bold,
+            TextColor = AppPalette.TitleText,
+            BackgroundColor = Colors.Transparent,
         };
 
     public static Label Caption(string text) =>
@@ -38,7 +41,37 @@ public static class SharedUiFactory
         {
             Text = text,
             FontSize = 12,
-            TextColor = Colors.Gray,
+            TextColor = AppPalette.CaptionText,
+            BackgroundColor = Colors.Transparent,
+        };
+
+    public static Label BodyLabel(string? text = null) =>
+        new()
+        {
+            Text = text,
+            FontSize = 14,
+            TextColor = AppPalette.BodyText,
+            BackgroundColor = Colors.Transparent,
+            LineBreakMode = LineBreakMode.WordWrap,
+        };
+
+    public static Label EmphasisLabel(string? text = null) =>
+        new()
+        {
+            Text = text,
+            FontSize = 16,
+            FontAttributes = FontAttributes.Bold,
+            TextColor = AppPalette.TitleText,
+            BackgroundColor = Colors.Transparent,
+        };
+
+    public static Label MutedLabel(string? text = null) =>
+        new()
+        {
+            Text = text,
+            FontSize = 11,
+            TextColor = AppPalette.CaptionText,
+            BackgroundColor = Colors.Transparent,
         };
 
     public static Entry Entry(string placeholder, bool isPassword = false, string? initialValue = null) =>
@@ -48,15 +81,24 @@ public static class SharedUiFactory
             IsPassword = isPassword,
             Text = initialValue,
             ClearButtonVisibility = ClearButtonVisibility.WhileEditing,
+            TextColor = AppPalette.BodyText,
+            PlaceholderColor = AppPalette.CaptionText,
+            BackgroundColor = Colors.Transparent,
         };
 
-    public static Button PrimaryButton(string text, EventHandler onClicked)
+    public static Button PrimaryButton(string text, EventHandler onClicked) =>
+        CreateActionButton(text, onClicked);
+
+    public static Button SecondaryButton(string text, EventHandler onClicked) =>
+        CreateActionButton(text, onClicked);
+
+    private static Button CreateActionButton(string text, EventHandler onClicked)
     {
         var button = new Button
         {
             Text = text,
-            BackgroundColor = Color.FromArgb("#2E6FE8"),
-            TextColor = Colors.White,
+            BackgroundColor = AppPalette.Primary,
+            TextColor = AppPalette.PrimaryText,
             CornerRadius = 8,
             Padding = new Thickness(14, 10),
         };
@@ -64,15 +106,8 @@ public static class SharedUiFactory
         return button;
     }
 
-    public static Button SecondaryButton(string text, EventHandler onClicked)
+    public static void ApplyPageChrome(ContentPage page, Color? backgroundColor = null)
     {
-        var button = new Button
-        {
-            Text = text,
-            CornerRadius = 8,
-            Padding = new Thickness(14, 10),
-        };
-        button.Clicked += onClicked;
-        return button;
+        page.BackgroundColor = backgroundColor ?? AppPalette.PageBackground;
     }
 }
