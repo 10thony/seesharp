@@ -9,7 +9,7 @@
             builder
                 .UseSharedMauiApp(Constants.WindowsApiBaseAddress);
 
-            return builder.Build();
+            return builder.BuildSharedMauiApp();
         }
     }
 }

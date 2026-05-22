@@ -9,7 +9,7 @@
             builder
                 .UseSharedMauiApp(Constants.AndroidEmulatorApiBaseAddress);
 
-            return builder.Build();
+            return builder.BuildSharedMauiApp();
         }
     }
 }
