@@ -13,4 +13,5 @@
   </Project>
   <Project Path="TestMAUIApp/TestMAUIApp.csproj" />
   <Project Path="RunBoth/RunBoth.csproj" />
+  <Project Path="BootDev/BootDev.csproj" />
 </Solution>
