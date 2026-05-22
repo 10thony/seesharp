@@ -17,6 +17,8 @@ public class DataBridgeService
         _database = new SQLiteAsyncConnection(Constants.DatabasePath, Constants.Flags);
         await _database.CreateTableAsync<LocalUser>().ConfigureAwait(false);
         await _database.CreateTableAsync<ChatMessageRecord>().ConfigureAwait(false);
+        await _database.CreateTableAsync<DirectThreadRecord>().ConfigureAwait(false);
+        await _database.CreateTableAsync<ChatGroupRecord>().ConfigureAwait(false);
         return _database;
     }
 
@@ -97,5 +99,70 @@ public class DataBridgeService
     {
         var database = await GetDatabaseAsync().ConfigureAwait(false);
         return await database.DeleteAsync(message).ConfigureAwait(false);
+    }
+
+    public async Task<List<DirectThreadRecord>> GetDirectThreadsAsync()
+    {
+        var database = await GetDatabaseAsync().ConfigureAwait(false);
+        return await database.Table<DirectThreadRecord>()
+            .OrderByDescending(t => t.CreatedAtUtc)
+            .ToListAsync()
+            .ConfigureAwait(false);
+    }
+
+    public async Task<DirectThreadRecord?> GetDirectThreadAsync(string recipientId)
+    {
+        var database = await GetDatabaseAsync().ConfigureAwait(false);
+        return await database.Table<DirectThreadRecord>()
+            .Where(t => t.RecipientId == recipientId)
+            .FirstOrDefaultAsync()
+            .ConfigureAwait(false);
+    }
+
+    public async Task SaveDirectThreadAsync(DirectThreadRecord thread)
+    {
+        var database = await GetDatabaseAsync().ConfigureAwait(false);
+        var existing = await GetDirectThreadAsync(thread.RecipientId).ConfigureAwait(false);
+        if (existing is null)
+        {
+            await database.InsertAsync(thread).ConfigureAwait(false);
+            return;
+        }
+
+        existing.RecipientName = thread.RecipientName;
+        await database.UpdateAsync(existing).ConfigureAwait(false);
+    }
+
+    public async Task<List<ChatGroupRecord>> GetGroupsAsync()
+    {
+        var database = await GetDatabaseAsync().ConfigureAwait(false);
+        return await database.Table<ChatGroupRecord>()
+            .OrderByDescending(g => g.CreatedAtUtc)
+            .ToListAsync()
+            .ConfigureAwait(false);
+    }
+
+    public async Task<ChatGroupRecord?> GetGroupAsync(string groupId)
+    {
+        var database = await GetDatabaseAsync().ConfigureAwait(false);
+        return await database.Table<ChatGroupRecord>()
+            .Where(g => g.GroupId == groupId)
+            .FirstOrDefaultAsync()
+            .ConfigureAwait(false);
+    }
+
+    public async Task SaveGroupAsync(ChatGroupRecord group)
+    {
+        var database = await GetDatabaseAsync().ConfigureAwait(false);
+        var existing = await GetGroupAsync(group.GroupId).ConfigureAwait(false);
+        if (existing is null)
+        {
+            await database.InsertAsync(group).ConfigureAwait(false);
+            return;
+        }
+
+        existing.Name = group.Name;
+        existing.MemberIds = group.MemberIds;
+        await database.UpdateAsync(existing).ConfigureAwait(false);
     }
 }
