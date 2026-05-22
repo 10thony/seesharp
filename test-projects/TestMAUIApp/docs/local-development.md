@@ -2,6 +2,8 @@
 
 Run the MAUI app on **Windows (WinUI)** and an **Android emulator** from this repo.
 
+For the full backend + Docker + both clients smoke test, see [full-stack-smoke-test.md](./full-stack-smoke-test.md).
+
 ## Backend API (required for sign-in and chat)
 
 Start **TestNativeMobileBackendAPI** on HTTP port **5000** before using the mobile app:
@@ -22,7 +24,25 @@ Demo sign-in (seeded user): **demo** / **Password1!**
 
 On a **physical Android device**, change `Constants.AndroidEmulatorApiBaseAddress` in the shared project to `http://<your-pc-lan-ip>:5000/` and ensure the API listens on that interface.
 
-## Quick start (both platforms)
+## Quick start (full stack)
+
+From `test-projects/TestMAUIApp`:
+
+```powershell
+dotnet run --project BootDev
+```
+
+This will:
+
+1. Start PostgreSQL via Docker (if `docker-compose.yml` is present)
+2. Start **TestNativeMobileBackendApi** on `http://localhost:5000` (skips if already running)
+3. Start the **WinUI** app (skips if already running)
+4. Start the **Android emulator** if none is online
+5. **Deploy the Android app only if the emulator was already running** — if the emulator had to cold-start, run the same command again once `adb devices` shows `device`
+
+Demo sign-in: **demo** / **Password1!**
+
+## Quick start (both platforms — MAUI only)
 
 From the repository root:
 

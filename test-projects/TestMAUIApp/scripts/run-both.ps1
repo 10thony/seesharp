@@ -88,7 +88,10 @@ function Wait-EmulatorBoot {
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     do {
         Start-Sleep -Seconds 4
-        $booted = & $Adb shell getprop sys.boot_completed 2>$null
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $booted = & $Adb shell getprop sys.boot_completed 2>&1
+        $ErrorActionPreference = $prevEap
         if ($booted -match '1') { return }
     } while ((Get-Date) -lt $deadline)
 
@@ -97,7 +100,10 @@ function Wait-EmulatorBoot {
 
 function Test-DeviceOnline {
     param([string]$Adb)
-    $lines = & $Adb devices 2>&1
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+  $lines = & $Adb devices 2>&1
+    $ErrorActionPreference = $prevEap
     return ($lines -match 'emulator-\d+\s+device' -or $lines -match '\S+\s+device')
 }
 
