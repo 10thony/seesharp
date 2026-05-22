@@ -1,41 +1,46 @@
+using TestMAUIApp.Configuration;
 using TestMAUIApp.Services;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace TestMAUIApp;
 
 public static class MobileAppServices
 {
-    public static string ApiBaseAddress { get; private set; } = Constants.DefaultApiBaseAddress;
+    private static IServiceProvider? _services;
 
-    public static LocalStorageService LocalStorageService { get; }
+    public static string ApiBaseAddress =>
+        _services?.GetService(typeof(AppOptions)) is AppOptions options
+            ? options.ApiBaseAddress
+            : Constants.DefaultApiBaseAddress;
 
-    public static HttpService HttpService { get; }
+    public static LocalStorageService LocalStorageService => GetRequired<LocalStorageService>();
 
-    public static DataBridgeService DataBridgeService { get; }
+    public static HttpService HttpService => GetRequired<HttpService>();
 
-    public static AuthenticationService AuthenticationService { get; }
+    public static DataBridgeService DataBridgeService => GetRequired<DataBridgeService>();
 
-    public static UserService UserService { get; }
+    public static AuthenticationService AuthenticationService => GetRequired<AuthenticationService>();
 
-    public static ChatService ChatService { get; }
+    public static UserService UserService => GetRequired<UserService>();
 
-    public static RealtimeChatService RealtimeChatService { get; }
+    public static ChatService ChatService => GetRequired<ChatService>();
 
-    static MobileAppServices()
+    public static RealtimeChatService RealtimeChatService => GetRequired<RealtimeChatService>();
+
+    public static INavigationService NavigationService => GetRequired<INavigationService>();
+
+    public static void Initialize(IServiceProvider services)
     {
-        LocalStorageService = new LocalStorageService();
-        HttpService = new HttpService();
-        DataBridgeService = new DataBridgeService();
-
-        AuthenticationService = new AuthenticationService(HttpService, LocalStorageService, DataBridgeService);
-        UserService = new UserService(HttpService, LocalStorageService, DataBridgeService, AuthenticationService);
-        ChatService = new ChatService(HttpService, DataBridgeService, AuthenticationService);
-        RealtimeChatService = new RealtimeChatService();
+        _services = services;
     }
 
-    public static void Configure(string apiBaseAddress)
+    private static T GetRequired<T>() where T : notnull
     {
-        ApiBaseAddress = apiBaseAddress;
-        HttpService.SetBaseAddress(apiBaseAddress);
-        AuthenticationService.ApplyStoredTokenToHttpClient();
+        if (_services is null)
+        {
+            throw new InvalidOperationException("MobileAppServices has not been initialized.");
+        }
+
+        return (T)_services.GetRequiredService(typeof(T));
     }
 }
