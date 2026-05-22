@@ -11,4 +11,5 @@ public interface IUserRepository
     void Insert(AppUser user);
     bool UpdateRole(Guid userId, string role);
     int CountByRole(string role);
+    IReadOnlyList<AppUser> ListActiveChatUsers(Guid? excludeUserId = null);
 }

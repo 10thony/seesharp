@@ -15,12 +15,26 @@ namespace TestNativeMobileBackendApi.Controllers;
 public class ChatController : ControllerBase
 {
     private readonly IChatRepository _chatRepository;
+    private readonly IUserRepository _users;
     private readonly IHubContext<ChatHub> _hubContext;
 
-    public ChatController(IChatRepository chatRepository, IHubContext<ChatHub> hubContext)
+    public ChatController(
+        IChatRepository chatRepository,
+        IUserRepository users,
+        IHubContext<ChatHub> hubContext)
     {
         _chatRepository = chatRepository;
+        _users = users;
         _hubContext = hubContext;
+    }
+
+    [HttpGet("users")]
+    public IActionResult GetUsers()
+    {
+        var userId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+        Guid? excludeId = userId is not null && Guid.TryParse(userId, out var id) ? id : null;
+        var users = _users.ListActiveChatUsers(excludeId);
+        return Ok(users.Select(u => new ChatUserSummary(u.Id, u.UserName, u.DisplayName)));
     }
 
     [HttpGet("messages")]
@@ -56,3 +70,5 @@ public class PostChatMessageRequest
     [Required]
     public string Message { get; set; } = string.Empty;
 }
+
+public record ChatUserSummary(Guid Id, string UserName, string DisplayName);

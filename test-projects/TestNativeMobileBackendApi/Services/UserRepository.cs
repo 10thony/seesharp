@@ -115,6 +115,30 @@ public class UserRepository : IUserRepository
         return Convert.ToInt32(command.ExecuteScalar());
     }
 
+    public IReadOnlyList<AppUser> ListActiveChatUsers(Guid? excludeUserId = null)
+    {
+        var users = new List<AppUser>();
+        using var connection = _dataSource.OpenConnection();
+        using var command = new NpgsqlCommand(
+            """
+            SELECT id, user_name, email, password_hash, display_name, role, is_active, created_at, updated_at
+            FROM app_users
+            WHERE is_active = TRUE
+              AND role IN ('User', 'Admin')
+              AND (@excludeUserId IS NULL OR id <> @excludeUserId)
+            ORDER BY display_name, user_name
+            """,
+            connection);
+        command.Parameters.AddWithValue("excludeUserId", (object?)excludeUserId ?? DBNull.Value);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            users.Add(Map(reader));
+        }
+
+        return users;
+    }
+
     private static AppUser Map(NpgsqlDataReader reader) =>
         new()
         {
