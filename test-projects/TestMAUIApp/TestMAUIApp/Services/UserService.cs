@@ -56,4 +56,31 @@ public class UserService
         _localStorage.SetString(LocalStorageService.CurrentUserIdKey, externalId);
         return user;
     }
+
+    public async Task<List<ChatUserOption>> GetChatUsersAsync(CancellationToken cancellationToken = default)
+    {
+        if (!_authentication.IsAuthenticated)
+        {
+            return [];
+        }
+
+        var remote = await _authentication.ExecuteAuthorizedAsync(
+            ct => _http.GetJsonAsync<List<ChatUserDto>>("api/chat/users", ct),
+            cancellationToken).ConfigureAwait(false);
+
+        if (remote is null)
+        {
+            return [];
+        }
+
+        return remote
+            .Select(dto => new ChatUserOption
+            {
+                UserId = dto.Id.ToString(),
+                UserName = dto.UserName,
+                DisplayName = dto.DisplayName,
+            })
+            .OrderBy(u => u.Label, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
 }
