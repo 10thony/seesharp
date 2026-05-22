@@ -129,7 +129,8 @@ try
             (keepOnlyIds, token) => KeepOnlyModelsLoadedAsync(models, keepOnlyIds, lmStudioBaseUri, apiKey, token),
             MarkModelActive,
             sessionRecorder,
-            cts.Token);
+            cts.Token,
+            args);
         return;
     }
 

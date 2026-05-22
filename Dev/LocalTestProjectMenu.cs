@@ -8,17 +8,11 @@ using SeeSharp.Models;
 namespace SeeSharp.Dev;
 
 /// <summary>
-/// Local dev-only harness: pick tasks, pick a project under <c>test-projects/</c>, set
-/// <c>HARNESS_WORKSPACE_ROOT</c>, run <see cref="LMStudioAgent.AgentLoop"/> on the first loaded model.
+/// Local dev harness: pick a workspace under <c>test-projects/</c>, contextualize it, then run an
+/// interactive agent chat against that project.
 /// </summary>
 public static class LocalTestProjectMenu
 {
-    enum HarnessMode
-    {
-        SingleProject = 1,
-        MultiProjectGenerated = 2
-    }
-
     /// <summary>Opt-in: original multi-model loop. Default is the interactive test harness in <see cref="RunAsync"/>.</summary>
     public static bool IsLegacyAllModelsMode(string[]? args)
     {
@@ -28,29 +22,14 @@ public static class LocalTestProjectMenu
                 a is not null && string.Equals(a, "--legacy", StringComparison.OrdinalIgnoreCase)));
     }
 
-    static readonly string[] PresetTasks =
+    /// <summary>Opt-in: batch run generated tasks across all test projects.</summary>
+    public static bool IsMultiProjectHarnessMode(string[]? args)
     {
-        //"Create an item model entity with columns for id, name, " +
-        //    "description, created_at, updated_at, updated_by, created_by, and status",
-        //"create an item status enum with values for active, inactive, and archived",
-        //"Create an API Controller for the Item model with CRUD functionality ",
-        //"create an oracle docker container for this project based off of " +
-        //    "https://www.oracle.com/database/free/get-started/ and name it cobec-oracle"
-            "Turn on the postgres docker container named testpostgres",
-            "Create a SQL file to create a user table with columns for ID" +
-                " (auto generated and incrementing Primary Key), name, role_id," +
-                "labor_category_code, ",
-            "Create a SQL script that creates an item with columns for, ID " +
-                "(auto generated and incrementing primary key)" +
-                "name, description, cost, manufacturer, location, owner (user id foreign key)," +
-                " status (item status lookup value)",
-            "Create a SQL script that creates an item status lookup table with values for" +
-                " active, inactive, and archived",
-            "Create a SQL script that creates a role lookup table with values for admin, user",
-            "Create a SQL script that creates a labor category lookup table with values for " +
-                "full time, part time, contractor,",
-            "Create a SQL Script that loads our postgres container with entities for the tables it contains.",
-    };
+        return string.Equals(Environment.GetEnvironmentVariable("SEESHARP_MULTI_PROJECT"), "1", StringComparison.Ordinal)
+            || (args is not null
+                && args.Any(static a =>
+                    a is not null && string.Equals(a, "--multi-project", StringComparison.OrdinalIgnoreCase)));
+    }
 
     public static async Task RunAsync(
         ApiKeyCredential credential,
@@ -61,7 +40,8 @@ public static class LocalTestProjectMenu
         Func<IReadOnlyCollection<string>, CancellationToken, Task>? keepOnlyModelsLoadedAsync,
         Action<string>? onModelActivated,
         SessionRecorder? sessionRecorder,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string[]? args = null)
     {
         if (models.Count == 0)
         {
@@ -79,10 +59,7 @@ public static class LocalTestProjectMenu
                 + "or the `--legacy` flow which enables auto `dotnet watch` only for the old multi-model mode.");
         }
 
-        if (!TrySelectHarnessMode(out HarnessMode mode))
-            return;
-
-        if (mode == HarnessMode.MultiProjectGenerated)
+        if (IsMultiProjectHarnessMode(args))
         {
             await RunGeneratedMultiProjectAsync(
                 credential,
@@ -97,17 +74,10 @@ public static class LocalTestProjectMenu
             return;
         }
 
-        if (!TrySelectTaskSource(out IReadOnlyList<string>? taskList) || taskList is null)
-            return;
-
-        if (taskList.Count == 0)
+        if (!TrySelectTestProjectDir(out string? projectDir) || string.IsNullOrEmpty(projectDir))
         {
-            ThemedConsole.WriteLine(TerminalTone.Error, "[TestHarness] No tasks to run. Exiting.");
             return;
         }
-
-        if (!TrySelectTestProjectDir(out string? projectDir) || string.IsNullOrEmpty(projectDir))
-            return;
 
         string expanded = Path.GetFullPath(projectDir);
         if (!Directory.Exists(expanded))
@@ -116,54 +86,64 @@ public static class LocalTestProjectMenu
             return;
         }
 
-        Environment.SetEnvironmentVariable("HARNESS_WORKSPACE_ROOT", expanded, EnvironmentVariableTarget.Process);
-        ThemedConsole.WriteLine(TerminalTone.Reasoning, $"[TestHarness] HARNESS_WORKSPACE_ROOT = {expanded}");
+        if (!TrySelectAgentModel(models, out OpenAIModel? agentModel) || agentModel is null)
+        {
+            return;
+        }
 
-        OpenAIModel firstModel = models[0];
-        ThemedConsole.WriteLine(TerminalTone.Reasoning,
-            "[TestHarness] Using first loaded model (single-model run in test mode).");
-        onModelActivated?.Invoke(firstModel.Id);
+        Environment.SetEnvironmentVariable("HARNESS_WORKSPACE_ROOT", expanded, EnvironmentVariableTarget.Process);
+        ThemedConsole.WriteLine(TerminalTone.Reasoning, $"[TestHarness] Workspace = {expanded}");
+        ThemedConsole.WriteLine(TerminalTone.Reasoning, $"[TestHarness] Agent model = {agentModel.Id}");
+
+        onModelActivated?.Invoke(agentModel.Id);
         onModelActivated?.Invoke(contextualizerModelId);
         if (keepOnlyModelsLoadedAsync is not null)
         {
             await keepOnlyModelsLoadedAsync(
-                new HashSet<string>(new[] { firstModel.Id, contextualizerModelId }, StringComparer.OrdinalIgnoreCase),
+                new HashSet<string>(new[] { agentModel.Id, contextualizerModelId }, StringComparer.OrdinalIgnoreCase),
                 cancellationToken);
         }
 
-        var config = AgentDefaults.ActiveConfig ?? new ResolvedConfig();
+        var projectConfig = SeeSharpConfigLoader.Load(expanded);
         var responsesClient = new ResponsesClient(credential, clientOptions);
         string lmStudioBaseUri = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URI")
             ?? "http://cobec-spark:1234/v1";
         string apiKey = Environment.GetEnvironmentVariable("LMSTUDIO_API_KEY") ?? "lm-studio";
-        using AgentRuntime runtime = AgentRuntimeFactory.Create(
-            firstModel,
-            config,
+
+        using (AgentUtilities.PushWorkspaceRoot(expanded))
+        using (AgentRuntime runtime = AgentRuntimeFactory.Create(
+            agentModel,
+            projectConfig,
             responsesClient,
             contextualizerChatClient,
             lmStudioBaseUri,
             apiKey,
             keepOnlyModelsLoadedAsync,
-            sessionRecorder);
-
-        sessionRecorder?.RecordSessionStart(firstModel.Id, expanded, contextualizerModelId);
-        var taskListForLoop = new List<string>(taskList);
-        _ = await runtime.Agent.AgentLoop(
-            responsesClient,
-            taskListForLoop,
-            cancellationToken);
+            sessionRecorder))
+        {
+            sessionRecorder?.RecordSessionStart(agentModel.Id, expanded, contextualizerModelId);
+            _ = await runtime.Agent.RunInteractiveChatAsync(responsesClient, cancellationToken: cancellationToken);
+        }
     }
 
-    static bool TrySelectHarnessMode(out HarnessMode mode)
+    static bool TrySelectAgentModel(IReadOnlyList<OpenAIModel> models, out OpenAIModel? model)
     {
-        mode = HarnessMode.SingleProject;
-        while (true)
+        model = null;
+        if (models.Count == 1)
         {
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "[TestHarness] Run mode:");
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "  1) Single project (existing interactive flow)");
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "  2) Multi-project generated tasks");
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "  Q) Quit");
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "Enter choice: ");
+            model = models[0];
+            return true;
+        }
+
+        for (;;)
+        {
+            ThemedConsole.WriteLine(TerminalTone.Reasoning, "[TestHarness] Loaded LM Studio models:");
+            for (int i = 0; i < models.Count; i++)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Reasoning, $"  {i}) {models[i].Id}");
+            }
+
+            ThemedConsole.WriteLine(TerminalTone.Reasoning, "Enter model number, or Q to quit: ");
             Console.Out.Flush();
             ThemedConsole.ApplyTone(TerminalTone.User);
             string? line = Console.ReadLine();
@@ -179,19 +159,14 @@ public static class LocalTestProjectMenu
                 return false;
             }
 
-            if (string.Equals(line, "1", StringComparison.Ordinal))
+            if (!int.TryParse(line, out int idx) || idx < 0 || idx >= models.Count)
             {
-                mode = HarnessMode.SingleProject;
-                return true;
+                ThemedConsole.WriteLine(TerminalTone.Error, "[TestHarness] Invalid model index.");
+                continue;
             }
 
-            if (string.Equals(line, "2", StringComparison.Ordinal))
-            {
-                mode = HarnessMode.MultiProjectGenerated;
-                return true;
-            }
-
-            ThemedConsole.WriteLine(TerminalTone.Error, "[TestHarness] Invalid mode choice.");
+            model = models[idx];
+            return true;
         }
     }
 
@@ -305,101 +280,18 @@ public static class LocalTestProjectMenu
             ThemedConsole.WriteLine(TerminalTone.Reasoning,
                 $"[TestHarness] Running project loop {i + 1}/{projects.Count} at {projectDir}");
 
-            // Reload config per-project since workspace root changes
             var projectConfig = SeeSharpConfigLoader.Load(projectDir);
-            var toolKit = new ToolKit(projectConfig);
-            var agent = new Agent(model, toolKit, contextualizerChatClient, projectConfig)
+            using (AgentUtilities.PushWorkspaceRoot(projectDir))
             {
-                SessionRecorder = sessionRecorder
-            };
-            sessionRecorder?.RecordSessionStart(model.Id, projectDir, contextualizerModelId);
-            _ = await agent.AgentLoop(responsesClient, new List<string>(tasks), cancellationToken);
+                var toolKit = new ToolKit(projectConfig);
+                var agent = new Agent(model, toolKit, contextualizerChatClient, projectConfig)
+                {
+                    SessionRecorder = sessionRecorder
+                };
+                sessionRecorder?.RecordSessionStart(model.Id, projectDir, contextualizerModelId);
+                _ = await agent.AgentLoop(responsesClient, new List<string>(tasks), cancellationToken);
+            }
         }
-    }
-
-    static bool TrySelectTaskSource(out IReadOnlyList<string>? list)
-    {
-        list = null;
-        while (true)
-        {
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "[TestHarness] Task source:");
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "  0) Run all preset tasks in order");
-            for (int i = 0; i < PresetTasks.Length; i++)
-            {
-                ThemedConsole.WriteLine(
-                    TerminalTone.Reasoning,
-                    $"  {i + 1}) {TrimOneLine(PresetTasks[i], 100)}");
-            }
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "  C) Enter a custom list (one per line, blank line ends)");
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "  Q) Quit");
-            ThemedConsole.WriteLine(TerminalTone.Reasoning, "Enter choice: ");
-            Console.Out.Flush();
-            ThemedConsole.ApplyTone(TerminalTone.User);
-            string? line = Console.ReadLine();
-            ThemedConsole.Reset();
-            if (line is null)
-            {
-                return false;
-            }
-
-            line = line.Trim();
-            if (string.Equals(line, "Q", StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            if (string.Equals(line, "0", StringComparison.Ordinal))
-            {
-                list = PresetTasks;
-                return true;
-            }
-
-            if (string.Equals(line, "C", StringComparison.OrdinalIgnoreCase))
-            {
-                return TryReadCustomTasks(out list);
-            }
-
-            if (int.TryParse(line, out int n) && n >= 1 && n <= PresetTasks.Length)
-            {
-                list = [PresetTasks[n - 1]];
-                return true;
-            }
-
-            ThemedConsole.WriteLine(TerminalTone.Error, "[TestHarness] Invalid choice.");
-        }
-    }
-
-    static bool TryReadCustomTasks(out IReadOnlyList<string>? list)
-    {
-        var lines = new List<string>();
-        ThemedConsole.WriteLine(TerminalTone.Reasoning, "Enter one task per line. Empty line to finish. (Q alone to cancel)");
-        while (true)
-        {
-            ThemedConsole.ApplyTone(TerminalTone.User);
-            string? s = Console.ReadLine();
-            ThemedConsole.Reset();
-            if (s is null)
-            {
-                list = null;
-                return false;
-            }
-
-            if (string.Equals(s.Trim(), "Q", StringComparison.OrdinalIgnoreCase))
-            {
-                list = null;
-                return false;
-            }
-
-            if (string.IsNullOrWhiteSpace(s))
-            {
-                break;
-            }
-
-            lines.Add(s.Trim());
-        }
-
-        list = lines;
-        return true;
     }
 
     static readonly (string Pattern, string Label)[] WorkspaceMarkers =
@@ -433,7 +325,9 @@ public static class LocalTestProjectMenu
             return false;
         }
 
-        var candidates = EnumerateWorkspaceCandidates(testRoot).ToList();
+        var candidates = EnumerateWorkspaceCandidates(testRoot)
+            .OrderBy(static c => c.DirectoryPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
         if (candidates.Count == 0)
         {
             ThemedConsole.WriteLine(TerminalTone.Error,
@@ -444,13 +338,14 @@ public static class LocalTestProjectMenu
         for (;;)
         {
             ThemedConsole.WriteLine(TerminalTone.Reasoning,
-                "[TestHarness] Test workspace candidates (directory containing marker file is used as workspace):");
+                "[TestHarness] Test projects (workspace = directory containing marker):");
             for (int i = 0; i < candidates.Count; i++)
             {
                 WorkspaceCandidate candidate = candidates[i];
+                string rel = Path.GetRelativePath(testRoot, candidate.DirectoryPath);
                 ThemedConsole.WriteLine(
                     TerminalTone.Reasoning,
-                    $"  {i}) {candidate.MarkerPath}  [{candidate.MarkerLabel}]");
+                    $"  {i}) {rel}  [{candidate.MarkerLabel}]");
             }
             ThemedConsole.WriteLine(TerminalTone.Reasoning, "Enter number, or Q to quit: ");
             Console.Out.Flush();
@@ -543,7 +438,6 @@ public static class LocalTestProjectMenu
                 continue;
             }
 
-            // Keep only unique tasks while preserving order.
             var seen = new HashSet<string>(StringComparer.Ordinal);
             List<string> deduped = new List<string>(tasks.Count);
             foreach (string task in tasks)
@@ -618,7 +512,6 @@ public static class LocalTestProjectMenu
             return false;
         }
 
-        // Supports forms like qwen3.6-27b and qwen/qwen3.6-35b-a3b.
         return id.Contains($"qwen{versionToken}", StringComparison.Ordinal)
             || id.Contains($"qwen/{versionToken}", StringComparison.Ordinal)
             || id.Contains(versionToken, StringComparison.Ordinal);
@@ -639,19 +532,6 @@ public static class LocalTestProjectMenu
             return qwen35[(projectIndex - qwen36.Count) % qwen35.Count];
         }
 
-        // No fallback models loaded; continue rotating through qwen 3.6 only.
         return qwen36[projectIndex % qwen36.Count];
-    }
-
-    static string TrimOneLine(string s, int max)
-    {
-        s = s.ReplaceLineEndings(" ");
-        s = s.Trim();
-        if (s.Length <= max)
-        {
-            return s;
-        }
-
-        return s[..max] + "…";
     }
 }

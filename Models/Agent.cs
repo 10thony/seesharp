@@ -21,6 +21,10 @@ namespace SeeSharp.Models
     public partial class Agent
     {
         public const string DefaultContextualizerModelId = "qwen/qwen3.5-2b";
+
+        /// <summary>Seed task used when contextualizing before an interactive chat session.</summary>
+        public const string InteractiveChatContextualizationSeed =
+            "Explore this workspace and build repository context for an interactive coding session.";
         private readonly ResolvedConfig _config;
         private static readonly Regex s_whitespace = new(@"\s+", RegexOptions.Compiled);
         private static readonly Regex s_gciRecurseFilter = new(
@@ -142,36 +146,141 @@ namespace SeeSharp.Models
             List<string> tasks,
             CancellationToken cancellationToken = default)
         {
-
-            if(tasks.Count() == 0)
+            if (tasks.Count == 0)
             {
                 return new StringBuilder("No tasks provided to agent.");
             }
 
             StringBuilder sb = new StringBuilder();
+            string? repoContext = await EnsureRepoContextAsync(tasks.First(), sb, cancellationToken)
+                .ConfigureAwait(false);
+            if (string.IsNullOrEmpty(repoContext))
+            {
+                return sb;
+            }
+
+            _sessionRecorder?.RecordSystemPrompt(GenerateSystemPrompt());
+
+            int taskIndex = 0;
+            foreach (string task in tasks)
+            {
+                if (!await RunOneUserTaskAsync(
+                        lmStudioResponsesClient,
+                        task,
+                        repoContext,
+                        taskIndex,
+                        sb,
+                        cancellationToken).ConfigureAwait(false))
+                {
+                    break;
+                }
+
+                taskIndex++;
+            }
+
+            return sb;
+        }
+
+        /// <summary>
+        /// Contextualizes the workspace once, then runs a read-eval loop: each user line is a task
+        /// until <c>exit</c> / <c>quit</c> / <c>q</c> or EOF.
+        /// </summary>
+        public async Task<StringBuilder> RunInteractiveChatAsync(
+            ResponsesClient responsesClient,
+            string? contextualizationSeed = null,
+            CancellationToken cancellationToken = default)
+        {
+            StringBuilder sb = new StringBuilder();
+            string seed = string.IsNullOrWhiteSpace(contextualizationSeed)
+                ? InteractiveChatContextualizationSeed
+                : contextualizationSeed.Trim();
+
+            string? repoContext = await EnsureRepoContextAsync(seed, sb, cancellationToken)
+                .ConfigureAwait(false);
+            if (string.IsNullOrEmpty(repoContext))
+            {
+                return sb;
+            }
+
+            _sessionRecorder?.RecordSystemPrompt(GenerateSystemPrompt());
+
+            ThemedConsole.WriteLine(TerminalTone.Reasoning,
+                "[Agent] Interactive chat ready. Enter a task (exit / quit / q to end).");
+            int taskIndex = 0;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                ThemedConsole.WriteLine(TerminalTone.Reasoning, "You: ");
+                Console.Out.Flush();
+                ThemedConsole.ApplyTone(TerminalTone.User);
+                string? line = Console.ReadLine();
+                ThemedConsole.Reset();
+                if (line is null)
+                {
+                    ThemedConsole.WriteLine(TerminalTone.Default, "Exiting the program. Goodbye!");
+                    break;
+                }
+
+                line = line.Trim();
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                if (IsInteractiveChatExit(line))
+                {
+                    ThemedConsole.WriteLine(TerminalTone.Default, "Exiting the program. Goodbye!");
+                    break;
+                }
+
+                if (!await RunOneUserTaskAsync(
+                        responsesClient,
+                        line,
+                        repoContext,
+                        taskIndex,
+                        sb,
+                        cancellationToken).ConfigureAwait(false))
+                {
+                    break;
+                }
+
+                taskIndex++;
+            }
+
+            return sb;
+        }
+
+        static bool IsInteractiveChatExit(string line) =>
+            string.Equals(line, "exit", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(line, "quit", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(line, "q", StringComparison.OrdinalIgnoreCase);
+
+        async Task<string?> EnsureRepoContextAsync(
+            string contextualizationTask,
+            StringBuilder sb,
+            CancellationToken cancellationToken)
+        {
             string repoContext = "";
 
-            // Subagents with shared repo context skip contextualization entirely
             if (!string.IsNullOrWhiteSpace(SharedRepoContext))
             {
                 repoContext = SharedRepoContext;
-                sb.AppendLine($"[SubAgent {AgentId}] Using shared repo context from parent; model {this.ModelId}");
+                sb.AppendLine($"[SubAgent {AgentId}] Using shared repo context from parent; model {ModelId}");
                 ThemedConsole.WriteLine(TerminalTone.Reasoning, sb.ToString());
             }
             else
             {
                 try
                 {
-                    sb.AppendLine($"Contextualizing Agent with local project." +
-                        $"; Running model {this.ModelId}");
-
+                    sb.AppendLine(
+                        $"Contextualizing Agent with local project; Running model {ModelId}");
                     ThemedConsole.WriteLine(TerminalTone.Reasoning, sb.ToString());
-                    repoContext = await ContextualizeAgentAsync(tasks.First(), cancellationToken)
+                    repoContext = await ContextualizeAgentAsync(contextualizationTask, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    ThemedConsole.WriteLine(TerminalTone.Error, "[Contextualizer] Exception during contextualization:");
+                    ThemedConsole.WriteLine(TerminalTone.Error,
+                        "[Contextualizer] Exception during contextualization:");
                     ThemedConsole.WriteLine(TerminalTone.Error, FormatExceptionDetail(ex));
                 }
             }
@@ -181,62 +290,58 @@ namespace SeeSharp.Models
                 ThemedConsole.WriteLine(TerminalTone.Error,
                     "[Contextualizer] No repository context was produced. " +
                     "See preceding [Contextualizer] debug lines (empty model output, bad JSON paths, or no file summaries).");
+                return null;
             }
 
-            if (!string.IsNullOrWhiteSpace(repoContext))
-            {
-                CurrentRepoContext = repoContext;
-                ToolKit.SubAgentManager?.SetSharedRepoContext(repoContext);
-                _sessionRecorder?.RecordRepoContext(repoContext);
-            }
-
+            CurrentRepoContext = repoContext;
+            ToolKit.SubAgentManager?.SetSharedRepoContext(repoContext);
+            _sessionRecorder?.RecordRepoContext(repoContext);
             sb.AppendLine($"[Contextualizer] {repoContext}");
-
             ThemedConsole.WriteLine(TerminalTone.Reasoning, $"[Contextualizer] {repoContext}");
+            return repoContext;
+        }
 
+        async Task<bool> RunOneUserTaskAsync(
+            ResponsesClient responsesClient,
+            string task,
+            string repoContext,
+            int taskIndex,
+            StringBuilder sb,
+            CancellationToken cancellationToken)
+        {
+            ToolKit.ResetTaskState();
 
-            _sessionRecorder?.RecordSystemPrompt(GenerateSystemPrompt());
-
-            int taskIndex = 0;
-            foreach (string task in tasks)
+            if (task.Contains("exit", StringComparison.OrdinalIgnoreCase))
             {
-                ToolKit.ResetTaskState();
-
-                if (task.Contains("exit", StringComparison.OrdinalIgnoreCase))
-                {
-                    ThemedConsole.WriteLine(TerminalTone.Default, "Exiting the program. Goodbye!");
-                    break;
-                }
-
-                if (String.IsNullOrEmpty(repoContext))
-                {
-                    ThemedConsole.WriteLine(TerminalTone.Error,
-                        "[Contextualizer] ERROR CONTEXTUALIZING AGENT — cannot run tasks without repo context.");
-                    break;
-                }
-
-                _sessionRecorder?.RecordUserTask(task, taskIndex);
-
-                ThemedConsole.WriteLine(TerminalTone.User, $"You: {task}");
-                sb.AppendLine($"You: {task}");
-
-                string finalAnswer = await ExecuteTaskWithToolLoopAsync(
-                    lmStudioResponsesClient,
-                    task,
-                    repoContext,
-                    taskIndex,
-                    cancellationToken).ConfigureAwait(false);
-
-                if (!string.IsNullOrWhiteSpace(finalAnswer))
-                {
-                    ThemedConsole.WriteLine(TerminalTone.Agent, $" {finalAnswer}");
-                    sb.AppendLine($"Agent: {finalAnswer}");
-                }
-
-                taskIndex++;
+                ThemedConsole.WriteLine(TerminalTone.Default, "Exiting the program. Goodbye!");
+                return false;
             }
 
-            return sb;
+            if (string.IsNullOrEmpty(repoContext))
+            {
+                ThemedConsole.WriteLine(TerminalTone.Error,
+                    "[Contextualizer] ERROR CONTEXTUALIZING AGENT — cannot run tasks without repo context.");
+                return false;
+            }
+
+            _sessionRecorder?.RecordUserTask(task, taskIndex);
+            ThemedConsole.WriteLine(TerminalTone.User, $"You: {task}");
+            sb.AppendLine($"You: {task}");
+
+            string finalAnswer = await ExecuteTaskWithToolLoopAsync(
+                responsesClient,
+                task,
+                repoContext,
+                taskIndex,
+                cancellationToken).ConfigureAwait(false);
+
+            if (!string.IsNullOrWhiteSpace(finalAnswer))
+            {
+                ThemedConsole.WriteLine(TerminalTone.Agent, $" {finalAnswer}");
+                sb.AppendLine($"Agent: {finalAnswer}");
+            }
+
+            return true;
         }
 
         private async Task<string> ExecuteTaskWithToolLoopAsync(
