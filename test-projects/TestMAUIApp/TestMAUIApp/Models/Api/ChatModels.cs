@@ -17,3 +17,12 @@ public class ChatMessageDto
 
     public DateTimeOffset SentAt { get; set; }
 }
+
+public class ChatUserDto
+{
+    public Guid Id { get; set; }
+
+    public string UserName { get; set; } = string.Empty;
+
+    public string DisplayName { get; set; } = string.Empty;
+}
