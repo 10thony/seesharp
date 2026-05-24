@@ -199,15 +199,15 @@ public static class LocalTestProjectMenu
             return;
         }
 
-        List<WorkspaceCandidate> primaryCandidates = candidates
-            .Where(static c => IsPrimaryHarnessWorkspace(c.DirectoryPath))
-            .ToList();
-        if (primaryCandidates.Count == 0)
+        List<WorkspaceGroup> groups = GroupWorkspaceCandidates(candidates);
+        if (groups.Count == 0)
         {
-            primaryCandidates = candidates;
+            ThemedConsole.WriteLine(TerminalTone.Error,
+                $"[TestHarness] No grouped developer projects under: {testRoot}");
+            return;
         }
 
-        Dictionary<string, List<string>> taskMap = BuildGeneratedTaskMap(primaryCandidates);
+        Dictionary<string, List<string>> taskMap = BuildGeneratedTaskMap(groups);
         if (taskMap.Count == 0)
         {
             ThemedConsole.WriteLine(TerminalTone.Error,
@@ -303,6 +303,8 @@ public static class LocalTestProjectMenu
 
     static readonly (string Pattern, string Label)[] WorkspaceMarkers =
     [
+        ("*.slnx", "Solution"),
+        ("*.sln", "Solution"),
         ("*.csproj", ".NET project"),
         ("package.json", "Node project"),
         ("pyproject.toml", "Python project"),
@@ -318,6 +320,13 @@ public static class LocalTestProjectMenu
         public required string DirectoryPath { get; init; }
         public required string MarkerPath { get; init; }
         public required string MarkerLabel { get; init; }
+    }
+
+    sealed class WorkspaceGroup
+    {
+        public required string RootDirectoryPath { get; init; }
+        public required string MarkerLabel { get; init; }
+        public required int MemberCount { get; init; }
     }
 
     static bool TrySelectTestProjectDir(out string? projectDir)
@@ -342,17 +351,28 @@ public static class LocalTestProjectMenu
             return false;
         }
 
+        var groups = GroupWorkspaceCandidates(candidates);
+        if (groups.Count == 0)
+        {
+            ThemedConsole.WriteLine(TerminalTone.Error,
+                $"[TestHarness] No grouped developer projects under: {testRoot}");
+            return false;
+        }
+
         for (;;)
         {
             ThemedConsole.WriteLine(TerminalTone.Reasoning,
-                "[TestHarness] Test projects (workspace = directory containing marker):");
-            for (int i = 0; i < candidates.Count; i++)
+                "[TestHarness] Developer projects (grouped by solution or standalone marker):");
+            for (int i = 0; i < groups.Count; i++)
             {
-                WorkspaceCandidate candidate = candidates[i];
-                string rel = Path.GetRelativePath(testRoot, candidate.DirectoryPath);
+                WorkspaceGroup group = groups[i];
+                string rel = Path.GetRelativePath(testRoot, group.RootDirectoryPath);
+                string memberSuffix = group.MemberCount > 1
+                    ? $", {group.MemberCount} markers"
+                    : "";
                 ThemedConsole.WriteLine(
                     TerminalTone.Reasoning,
-                    $"  {i}) {rel}  [{candidate.MarkerLabel}]");
+                    $"  {i}) {rel}  [{group.MarkerLabel}{memberSuffix}]");
             }
             ThemedConsole.WriteLine(TerminalTone.Reasoning, "Enter number, or Q to quit: ");
             Console.Out.Flush();
@@ -370,13 +390,13 @@ public static class LocalTestProjectMenu
                 return false;
             }
 
-            if (!int.TryParse(line, out int idx) || idx < 0 || idx >= candidates.Count)
+            if (!int.TryParse(line, out int idx) || idx < 0 || idx >= groups.Count)
             {
                 ThemedConsole.WriteLine(TerminalTone.Error, "[TestHarness] Invalid project index.");
                 continue;
             }
 
-            string selectedDir = Path.GetFullPath(candidates[idx].DirectoryPath);
+            string selectedDir = Path.GetFullPath(groups[idx].RootDirectoryPath);
             if (string.IsNullOrEmpty(selectedDir) || !Directory.Exists(selectedDir))
             {
                 ThemedConsole.WriteLine(TerminalTone.Error, "[TestHarness] Could not resolve project directory.");
@@ -432,43 +452,153 @@ public static class LocalTestProjectMenu
         }
     }
 
+    static List<WorkspaceGroup> GroupWorkspaceCandidates(IReadOnlyList<WorkspaceCandidate> candidates)
+    {
+        if (candidates.Count == 0)
+        {
+            return [];
+        }
+
+        var solutionRoots = candidates
+            .Where(static c => string.Equals(c.MarkerLabel, "Solution", StringComparison.Ordinal))
+            .Select(static c => Path.GetFullPath(c.DirectoryPath))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static p => p.Count(ch => ch is '/' or '\\'))
+            .ThenBy(static p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var outerSolutionRoots = new List<string>();
+        foreach (string root in solutionRoots)
+        {
+            if (outerSolutionRoots.Any(existing =>
+                    IsSameOrUnderDirectory(root, existing)))
+            {
+                continue;
+            }
+
+            outerSolutionRoots.Add(root);
+        }
+
+        var groups = new List<WorkspaceGroup>();
+        var assigned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string root in outerSolutionRoots)
+        {
+            if (!PassesHarnessOnlyFilter(root))
+            {
+                continue;
+            }
+
+            List<WorkspaceCandidate> members = candidates
+                .Where(c => IsSameOrUnderDirectory(c.DirectoryPath, root))
+                .ToList();
+            foreach (WorkspaceCandidate member in members)
+            {
+                _ = assigned.Add(member.DirectoryPath);
+            }
+
+            groups.Add(new WorkspaceGroup
+            {
+                RootDirectoryPath = root,
+                MarkerLabel = ResolveGroupMarkerLabel(root, members),
+                MemberCount = members.Count
+            });
+        }
+
+        foreach (WorkspaceCandidate candidate in candidates
+                     .OrderBy(static c => c.DirectoryPath, StringComparer.OrdinalIgnoreCase))
+        {
+            if (assigned.Contains(candidate.DirectoryPath))
+            {
+                continue;
+            }
+
+            if (IsHarnessExcludedLeaf(candidate.DirectoryPath))
+            {
+                continue;
+            }
+
+            if (!PassesHarnessOnlyFilter(candidate.DirectoryPath))
+            {
+                continue;
+            }
+
+            groups.Add(new WorkspaceGroup
+            {
+                RootDirectoryPath = candidate.DirectoryPath,
+                MarkerLabel = candidate.MarkerLabel,
+                MemberCount = 1
+            });
+            _ = assigned.Add(candidate.DirectoryPath);
+        }
+
+        return groups
+            .OrderBy(static g => g.RootDirectoryPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    static string ResolveGroupMarkerLabel(string root, IReadOnlyList<WorkspaceCandidate> members)
+    {
+        WorkspaceCandidate? atRoot = members.FirstOrDefault(c =>
+            string.Equals(Path.GetFullPath(c.DirectoryPath), root, StringComparison.OrdinalIgnoreCase));
+        if (atRoot is not null)
+        {
+            return atRoot.MarkerLabel;
+        }
+
+        return members.FirstOrDefault(c =>
+                   string.Equals(c.MarkerLabel, "Solution", StringComparison.Ordinal))?.MarkerLabel
+               ?? members[0].MarkerLabel;
+    }
+
+    static bool IsSameOrUnderDirectory(string path, string root)
+    {
+        string fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (string.Equals(fullPath, fullRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        string prefix = fullRoot + Path.DirectorySeparatorChar;
+        return fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool PassesHarnessOnlyFilter(string directoryPath)
+    {
+        string? only = Environment.GetEnvironmentVariable("SEESHARP_HARNESS_ONLY");
+        if (string.IsNullOrWhiteSpace(only))
+        {
+            return true;
+        }
+
+        string norm = directoryPath.Replace('\\', '/');
+        return norm.IndexOf(only.Trim(), StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
     /// <summary>
-    /// Multi-project harness should target one workspace per app (shared MAUI library, API root, etc.),
-    /// not every platform head, test project, or tooling folder under test-projects.
+    /// Platform heads, test projects, and tooling folders are grouped under a parent solution
+    /// but should not appear as standalone developer projects in the menu.
     /// </summary>
-    static bool IsPrimaryHarnessWorkspace(string directoryPath)
+    static bool IsHarnessExcludedLeaf(string directoryPath)
     {
         string norm = directoryPath.Replace('\\', '/');
-        string? only = Environment.GetEnvironmentVariable("SEESHARP_HARNESS_ONLY");
-        if (!string.IsNullOrWhiteSpace(only)
-            && norm.IndexOf(only.Trim(), StringComparison.OrdinalIgnoreCase) < 0)
-        {
-            return false;
-        }
-        if (norm.Contains("/RunBoth", StringComparison.OrdinalIgnoreCase)
+        return norm.Contains("/RunBoth", StringComparison.OrdinalIgnoreCase)
             || norm.Contains(".Droid", StringComparison.OrdinalIgnoreCase)
             || norm.Contains(".iOS", StringComparison.OrdinalIgnoreCase)
             || norm.Contains(".Mac", StringComparison.OrdinalIgnoreCase)
             || norm.Contains(".WinUI", StringComparison.OrdinalIgnoreCase)
             || norm.EndsWith(".Tests", StringComparison.OrdinalIgnoreCase)
             || norm.Contains("/infra/tools/", StringComparison.OrdinalIgnoreCase)
-            || norm.EndsWith(".Client", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        return norm.EndsWith("/TestMAUIApp/TestMAUIApp", StringComparison.OrdinalIgnoreCase)
-            || norm.EndsWith("/TestNativeMobileBackendApi", StringComparison.OrdinalIgnoreCase)
-            || norm.EndsWith("/TestMinimalWebApi", StringComparison.OrdinalIgnoreCase)
-            || norm.EndsWith("/TestSignalRBlazorApp/TestSignalRBlazorApp", StringComparison.OrdinalIgnoreCase);
+            || norm.EndsWith(".Client", StringComparison.OrdinalIgnoreCase);
     }
 
-    static Dictionary<string, List<string>> BuildGeneratedTaskMap(IReadOnlyList<WorkspaceCandidate> candidates)
+    static Dictionary<string, List<string>> BuildGeneratedTaskMap(IReadOnlyList<WorkspaceGroup> groups)
     {
         var map = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (WorkspaceCandidate candidate in candidates)
+        foreach (WorkspaceGroup group in groups)
         {
-            string projectDir = Path.GetFullPath(candidate.DirectoryPath);
+            string projectDir = Path.GetFullPath(group.RootDirectoryPath);
             string projectName = Path.GetFileName(projectDir);
             List<string> tasks = BuildGeneratedTasksForProject(projectDir, projectName);
             if (tasks.Count == 0)
@@ -508,19 +638,20 @@ public static class LocalTestProjectMenu
             ];
         }
 
-        if (normalized.Contains("testnativemobilebackendapi", StringComparison.Ordinal)
-            && !normalized.Contains(".tests", StringComparison.Ordinal)
-            && !normalized.Contains("/infra/tools/", StringComparison.Ordinal))
+        if (normalized.Contains("nativemobilechat", StringComparison.Ordinal))
         {
             return
             [
                 "REQUIRED: Read target files with BASH Get-Content -Raw, then apply edits with BASH Set-Content or EDIT_FILE using exact old text. Verify with read-back. Prose-only answers fail validation.",
-                "Tier 1: In ChatController.PostMessage and ChatHub.SendMessage, reject empty or whitespace-only messages with a consistent validation error payload.",
-                "Tier 1: Add max message length guardrails (e.g. 2000 chars) on REST and hub send paths with ProblemDetails or equivalent JSON errors.",
-                "Tier 2: Standardize API error responses to one shape { code, message } for BadRequest, Unauthorized, and Conflict across chat and auth controllers.",
-                "Tier 2: Add optional sinceUtc query parameter to GET api/chat/messages for incremental history fetch with stable ordering.",
-                "Tier 3: Ensure ChatRepository.Insert persists before hub broadcast and handle database failures without broadcasting partial events.",
-                "Tier 4: Add integration tests for chat validation, unauthorized access, successful post + hub ReceiveMessage broadcast, and sinceUtc filtering."
+                "Tier 1 (API): In ChatController.PostMessage and ChatHub.SendMessage, reject empty or whitespace-only messages with a consistent validation error payload.",
+                "Tier 1 (API): Add max message length guardrails (e.g. 2000 chars) on REST and hub send paths with ProblemDetails or equivalent JSON errors.",
+                "Tier 1 (Client): In ChatService and RealtimeChatService, reject empty or whitespace-only message content before calling the API or hub; surface a clear user-visible hint on MainPage.",
+                "Tier 1 (Client): Add max message length guardrails (e.g. 2000 chars) on send in the MAUI client aligned with server expectations.",
+                "Tier 2 (API): Standardize API error responses to one shape { code, message } for BadRequest, Unauthorized, and Conflict across chat and auth controllers.",
+                "Tier 2 (Client): When RealtimeChatService receives ReceiveMessage, map payload into ChatMessageRecord and persist via DataBridgeService so the list updates without a full refresh.",
+                "Tier 3 (Client): Add defensive handling when API base address is unreachable (show connection status on MainPage, avoid duplicate pending sends).",
+                "Tier 3 (API): Ensure ChatRepository.Insert persists before hub broadcast and handle database failures without broadcasting partial events.",
+                "Tier 4: Add integration tests for chat validation, unauthorized access, successful post + hub ReceiveMessage broadcast, and client/server alignment."
             ];
         }
 
@@ -534,20 +665,6 @@ public static class LocalTestProjectMenu
                 "Tier 2: Add lightweight in-memory presence tracking keyed by connection id and normalized username.",
                 "Tier 3: Add reconnect-safe client flow that re-establishes the hub connection and re-announces presence.",
                 "Tier 4: Add SignalR integration tests for broadcast delivery, validation rejection, and reconnect-presence behavior."
-            ];
-        }
-
-        if (normalized.Contains("testmauiapp", StringComparison.Ordinal)
-            && normalized.EndsWith("/testmauiapp/testmauiapp", StringComparison.Ordinal))
-        {
-            return
-            [
-                "Tier 1: In ChatService and RealtimeChatService, reject empty or whitespace-only message content before calling the API or hub; surface a clear user-visible hint on MainPage.",
-                "Tier 1: Add max message length guardrails (e.g. 2000 chars) on send in the MAUI client aligned with server expectations.",
-                "Tier 2: When RealtimeChatService receives ReceiveMessage, map payload into ChatMessageRecord and persist via DataBridgeService so the list updates without a full refresh.",
-                "Tier 2: On hub reconnect, trigger a server refresh (GetMessagesAsync refreshFromServer) so offline gaps are filled.",
-                "Tier 3: Add defensive handling when API base address is unreachable (show connection status on MainPage, avoid duplicate pending sends).",
-                "Tier 4: Add unit tests for ChatService message mapping and empty-message validation using mocks for HttpService and DataBridgeService."
             ];
         }
 
